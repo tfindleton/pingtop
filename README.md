@@ -21,6 +21,7 @@
 
 - live terminal UI with redraws, color, and keyboard controls
 - concurrent ping and DNS checks with simple failure classification
+- cancellable check cycles with live checking, stale, and age indicators
 - interactive mode and headless mode
 - quiet logging modes, including only state changes or no logging
 - single-binary releases for Linux, macOS, and Windows
@@ -92,6 +93,7 @@ The interactive UI starts with help visible by default and remembers the last he
 - `q` or `Esc`: quit
 - `p`: pause or resume
 - `h`: show or hide help
+- `f`: force a fresh check cycle
 - `s`: save a snapshot
 - `r`: reset session counters
 - `u`: open the release page

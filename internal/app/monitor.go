@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,13 +13,16 @@ type BackgroundMonitor struct {
 	logger        *CSVLogger
 	coordinator   *CheckCoordinator
 
-	stopCh   chan struct{}
-	wakeCh   chan struct{}
-	doneCh   chan struct{}
-	pauseMu  sync.RWMutex
-	paused   bool
-	sequence int64
-	cycleID  int32
+	stopCh      chan struct{}
+	wakeCh      chan struct{}
+	doneCh      chan struct{}
+	pauseMu     sync.RWMutex
+	paused      bool
+	sequence    int64
+	cycleID     int32
+	generation  int64
+	cycleMu     sync.Mutex
+	cancelCycle context.CancelFunc
 }
 
 type monitorSignal int
@@ -56,6 +60,7 @@ func (monitor *BackgroundMonitor) Stop() {
 	default:
 		close(monitor.stopCh)
 	}
+	monitor.cancelActiveCycle()
 	<-monitor.doneCh
 }
 
@@ -66,11 +71,22 @@ func (monitor *BackgroundMonitor) Wake() {
 	}
 }
 
+func (monitor *BackgroundMonitor) ForceRefresh() {
+	atomic.AddInt64(&monitor.generation, 1)
+	monitor.cancelActiveCycle()
+	monitor.stateStore.ClearActiveCycle()
+	monitor.Wake()
+}
+
 func (monitor *BackgroundMonitor) TogglePause() bool {
 	monitor.pauseMu.Lock()
 	defer monitor.pauseMu.Unlock()
 	monitor.paused = !monitor.paused
-	monitor.Wake()
+	if monitor.paused {
+		monitor.ForceRefresh()
+	} else {
+		monitor.Wake()
+	}
 	return monitor.paused
 }
 
@@ -82,7 +98,7 @@ func (monitor *BackgroundMonitor) IsPaused() bool {
 
 func (monitor *BackgroundMonitor) RunSingleCycle(config AppConfig) []CheckResult {
 	cycleID := int(atomic.AddInt32(&monitor.cycleID, 1))
-	results := monitor.coordinator.ExecuteCycle(config, cycleID)
+	results := monitor.coordinator.ExecuteCycleContext(context.Background(), config, cycleID, nil)
 	monitor.stampSequences(results)
 	return results
 }
@@ -121,10 +137,50 @@ func (monitor *BackgroundMonitor) run() {
 		}
 
 		config := monitor.configManager.Snapshot()
-		results := monitor.RunSingleCycle(config)
-		monitor.stateStore.HandleCycle(results, config, monitor.CurrentCycleID())
+		cycleID := int(atomic.AddInt32(&monitor.cycleID, 1))
+		generation := atomic.LoadInt64(&monitor.generation)
+		ctx, cancel := monitor.newCycleContext()
+		monitor.stateStore.BeginCycle(cycleID, generation, config, time.Now())
+		results := monitor.coordinator.ExecuteCycleContext(ctx, config, cycleID, func() {
+			monitor.stateStore.NoteCycleProgress(cycleID, generation)
+		})
+		cycleCanceled := ctx.Err() != nil
+		monitor.clearCycleContext(cancel)
+		if cycleCanceled || generation != atomic.LoadInt64(&monitor.generation) {
+			monitor.stateStore.FinishCycle(cycleID, generation)
+			nextRun = time.Now()
+			continue
+		}
+		monitor.stampSequences(results)
+		monitor.stateStore.HandleCycle(results, config, cycleID)
 		monitor.logger.LogResults(results, config)
 		nextRun = time.Now().Add(time.Duration(config.CheckIntervalSeconds * float64(time.Second)))
+	}
+}
+
+func (monitor *BackgroundMonitor) newCycleContext() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	monitor.cycleMu.Lock()
+	monitor.cancelCycle = cancel
+	monitor.cycleMu.Unlock()
+	return ctx, cancel
+}
+
+func (monitor *BackgroundMonitor) clearCycleContext(cancel context.CancelFunc) {
+	monitor.cycleMu.Lock()
+	if monitor.cancelCycle != nil {
+		monitor.cancelCycle = nil
+	}
+	monitor.cycleMu.Unlock()
+	cancel()
+}
+
+func (monitor *BackgroundMonitor) cancelActiveCycle() {
+	monitor.cycleMu.Lock()
+	cancel := monitor.cancelCycle
+	monitor.cycleMu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 }
 

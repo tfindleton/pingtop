@@ -86,10 +86,10 @@ type DiagnosisAssessment struct {
 }
 
 type CounterSummary struct {
-	Checks      int
-	Successes   int
-	Failures    int
-	DNSFailures int
+	Checks       int
+	Successes    int
+	Failures     int
+	DNSFailures  int
 	PingFailures int
 }
 
@@ -140,29 +140,31 @@ type RollingWindowBucket struct {
 }
 
 type TargetStats struct {
-	Target              string
-	TargetType          string
-	TotalChecks         int
-	SuccessCount        int
-	FailureCount        int
-	DNSFailureCount     int
-	PingFailureCount    int
-	ConsecutiveFailures int
+	Target               string
+	TargetType           string
+	Checking             bool
+	TotalChecks          int
+	SuccessCount         int
+	FailureCount         int
+	DNSFailureCount      int
+	PingFailureCount     int
+	ConsecutiveFailures  int
 	ConsecutiveSuccesses int
-	RecoveryPending     bool
-	LastState           string
-	LastResult          string
-	LastLatencyMS       *float64
-	LastResolvedIP      string
-	LastErrorCategory   string
-	LastErrorMessage    string
-	LastCheckedAt       time.Time
-	WindowSummary       CounterSummary
+	RecoveryPending      bool
+	LastState            string
+	LastResult           string
+	LastLatencyMS        *float64
+	LastResolvedIP       string
+	LastErrorCategory    string
+	LastErrorMessage     string
+	LastCheckedAt        time.Time
+	WindowSummary        CounterSummary
 }
 
 func (stats *TargetStats) Apply(result CheckResult) (string, string) {
 	previousState := stats.LastState
 	previousError := stats.LastErrorCategory
+	stats.Checking = false
 	stats.TotalChecks++
 	stats.LastCheckedAt = result.Timestamp
 	if result.ResolvedIP != "" {
@@ -258,6 +260,16 @@ type StateSnapshot struct {
 	StatsWindowSeconds   int
 	LastCycleCompletedAt time.Time
 	LastCycleID          int
+	ActiveCycle          CycleStatus
+}
+
+type CycleStatus struct {
+	Active          bool
+	CycleID         int
+	Generation      int64
+	StartedAt       time.Time
+	TotalChecks     int
+	CompletedChecks int
 }
 
 type PromptState struct {

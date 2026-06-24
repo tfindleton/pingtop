@@ -81,6 +81,7 @@ type StateStore struct {
 	confirmedDiagnosis     string
 	pendingDiagnosis       string
 	pendingDiagnosisStreak int
+	activeCycle            CycleStatus
 	lastCycleCompletedAt   time.Time
 	lastCycleID            int
 	revision               uint64
@@ -163,6 +164,69 @@ func (store *StateStore) AddEvent(level, message string, timestamp time.Time) {
 	defer store.mu.Unlock()
 	store.addEventLocked(level, message, timestamp)
 	store.revision++
+}
+
+func (store *StateStore) BeginCycle(cycleID int, generation int64, config AppConfig, timestamp time.Time) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	store.syncTargetsLocked(config)
+	if timestamp.IsZero() {
+		timestamp = time.Now()
+	}
+	store.activeCycle = CycleStatus{
+		Active:          true,
+		CycleID:         cycleID,
+		Generation:      generation,
+		StartedAt:       timestamp,
+		TotalChecks:     len(config.Targets),
+		CompletedChecks: 0,
+	}
+	for _, target := range config.Targets {
+		if stats := store.stats[target.Value]; stats != nil {
+			stats.Checking = true
+		}
+	}
+	store.revision++
+}
+
+func (store *StateStore) NoteCycleProgress(cycleID int, generation int64) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if !store.activeCycle.Active || store.activeCycle.CycleID != cycleID || store.activeCycle.Generation != generation {
+		return
+	}
+	if store.activeCycle.CompletedChecks < store.activeCycle.TotalChecks {
+		store.activeCycle.CompletedChecks++
+	}
+	store.revision++
+}
+
+func (store *StateStore) FinishCycle(cycleID int, generation int64) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if !store.activeCycle.Active || store.activeCycle.CycleID != cycleID || store.activeCycle.Generation != generation {
+		return
+	}
+	store.clearActiveCycleLocked()
+	store.revision++
+}
+
+func (store *StateStore) ClearActiveCycle() {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if !store.activeCycle.Active {
+		return
+	}
+	store.clearActiveCycleLocked()
+	store.revision++
+}
+
+func (store *StateStore) clearActiveCycleLocked() {
+	store.activeCycle = CycleStatus{}
+	for _, stats := range store.stats {
+		stats.Checking = false
+	}
 }
 
 func (store *StateStore) addEventLocked(level, message string, timestamp time.Time) {
@@ -262,6 +326,7 @@ func (store *StateStore) HandleCycle(results []CheckResult, config AppConfig, cy
 	if store.updateDiagnosisLocked(assessment, config) && config.LoggingMode != LoggingModeOff {
 		store.addEventLocked("info", "Diagnosis changed: "+store.diagnosis, store.lastCycleCompletedAt)
 	}
+	store.clearActiveCycleLocked()
 	store.revision++
 }
 
@@ -316,6 +381,7 @@ func (store *StateStore) Snapshot() StateSnapshot {
 		StatsWindowSeconds:   store.statsWindowSeconds,
 		LastCycleCompletedAt: store.lastCycleCompletedAt,
 		LastCycleID:          store.lastCycleID,
+		ActiveCycle:          store.activeCycle,
 	}
 }
 

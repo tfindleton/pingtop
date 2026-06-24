@@ -135,8 +135,8 @@ jobs:
             .
 
           cp README.md "${staging_dir}/README.md"
-          if [ -f License.txt ]; then
-            cp License.txt "${staging_dir}/License.txt"
+          if [ -f LICENSE ]; then
+            cp LICENSE "${staging_dir}/LICENSE"
           fi
 
           archive_path="dist/${package_name}.${ARCHIVE_EXT}"

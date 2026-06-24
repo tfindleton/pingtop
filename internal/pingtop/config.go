@@ -83,7 +83,7 @@ func defaultConfig() AppConfig {
 		Version:                  1,
 		CheckIntervalSeconds:     1.0,
 		PingTimeoutMS:            1200,
-		UIRefreshIntervalSeconds: 0.5,
+		UIRefreshIntervalSeconds: 1.0,
 		HelpVisible:              true,
 		StatsWindowSeconds:       3600,
 		UpdateCheckEnabled:       true,

@@ -65,6 +65,30 @@ func TestDNSResolverUsesContextCancellation(t *testing.T) {
 	}
 }
 
+func TestExecuteCycleContextReturnsPromptlyWhenCanceled(t *testing.T) {
+	resolver := NewDNSResolver(func(ctx context.Context, hostname string) (bool, string, string) {
+		<-ctx.Done()
+		return false, "", ctx.Err().Error()
+	})
+	coordinator := NewCheckCoordinator(NewPingRunner(), resolver)
+	defer coordinator.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	started := time.Now()
+	results := coordinator.ExecuteCycleContext(ctx, AppConfig{
+		PingTimeoutMS: 1200,
+		Targets:       []TargetSpec{{Value: "slow.example", Kind: "hostname"}},
+	}, 1, nil)
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("expected canceled cycle to return promptly, took %s", elapsed)
+	}
+	if results != nil {
+		t.Fatalf("expected canceled cycle to return nil results, got %#v", results)
+	}
+}
+
 func equalStrings(left, right []string) bool {
 	if len(left) != len(right) {
 		return false

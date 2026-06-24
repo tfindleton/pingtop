@@ -588,6 +588,9 @@ func (ui *PingTopUI) handleKey(key string) {
 		ui.dirty = true
 		ui.stateStore.ResetCounters()
 		ui.stateStore.AddEvent("info", "Counters reset", time.Time{})
+	case "f":
+		ui.dirty = true
+		ui.forceRefreshChecks()
 	case "s":
 		ui.dirty = true
 		path := ui.saveSnapshotReport()
@@ -704,8 +707,17 @@ func (ui *PingTopUI) cycleLoggingMode() {
 	ui.configManager.Update(func(config *pingtop.AppConfig) {
 		config.LoggingMode = nextMode
 	})
-	ui.monitor.Wake()
+	ui.monitor.ForceRefresh()
 	ui.stateStore.AddEvent("info", "Logging mode set to "+nextMode, time.Time{})
+}
+
+func (ui *PingTopUI) forceRefreshChecks() {
+	ui.monitor.ForceRefresh()
+	if ui.monitor.IsPaused() {
+		ui.stateStore.AddEvent("info", "Fresh check queued; monitoring paused", time.Time{})
+		return
+	}
+	ui.stateStore.AddEvent("info", "Forced fresh check cycle", time.Time{})
 }
 
 func (ui *PingTopUI) adjustCheckInterval(delta float64) {
@@ -722,7 +734,7 @@ func (ui *PingTopUI) adjustCheckInterval(delta float64) {
 	config := ui.configManager.Update(func(config *pingtop.AppConfig) {
 		config.CheckIntervalSeconds = next
 	})
-	ui.monitor.Wake()
+	ui.monitor.ForceRefresh()
 	ui.stateStore.AddEvent("info", fmt.Sprintf("Check interval set to %.2fs", config.CheckIntervalSeconds), time.Time{})
 }
 
@@ -757,7 +769,7 @@ func (ui *PingTopUI) submitAddTarget(raw string) {
 		config.Targets = append(config.Targets, target)
 	})
 	ui.stateStore.SyncTargets(config)
-	ui.monitor.Wake()
+	ui.monitor.ForceRefresh()
 	ui.stateStore.AddEvent("info", "Added target "+target.Value, time.Time{})
 }
 
@@ -797,7 +809,7 @@ func (ui *PingTopUI) submitDeleteTarget(raw string) {
 	})
 	ui.stateStore.SyncTargets(config)
 	if removed {
-		ui.monitor.Wake()
+		ui.monitor.ForceRefresh()
 		ui.stateStore.AddEvent("info", "Deleted target "+targetToRemove, time.Time{})
 	} else {
 		ui.stateStore.AddEvent("warn", "Delete target failed: no match for "+raw, time.Time{})
@@ -830,7 +842,7 @@ func (ui *PingTopUI) submitWindow(raw string) {
 		config.AroundFailureBefore = beforeValue
 		config.AroundFailureAfter = afterValue
 	})
-	ui.monitor.Wake()
+	ui.monitor.ForceRefresh()
 	ui.stateStore.AddEvent(
 		"info",
 		fmt.Sprintf("Around-failure window set to %d/%ds", config.AroundFailureBefore, config.AroundFailureAfter),
@@ -852,7 +864,7 @@ func (ui *PingTopUI) submitStatsWindow(raw string) {
 		config.StatsWindowSeconds = statsWindowSeconds
 	})
 	if ui.stateStore.SyncTargets(config) {
-		ui.monitor.Wake()
+		ui.monitor.ForceRefresh()
 		ui.stateStore.AddEvent(
 			"info",
 			fmt.Sprintf("Stats window set to %s; rolling counters reset", pingtop.FormatCompactSpan(config.StatsWindowSeconds)),

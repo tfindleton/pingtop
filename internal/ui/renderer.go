@@ -289,6 +289,7 @@ func (renderer *Renderer) buildScreenChrome(
 	headerLines = append(headerLines,
 		renderer.wrapPairs("Status", []textPair{
 			renderer.kvPair("mode", status, "white", statusColor),
+			renderer.kvPair("active", renderer.activeCycleText(snapshot.ActiveCycle), "white", renderer.activeCycleColor(snapshot.ActiveCycle)),
 			renderer.kvPair("update", renderer.updateStatusText(updateStatus), "white", renderer.updateStatusColor(updateStatus)),
 			renderer.kvPair("events", eventStatus, "white", ""),
 			renderer.kvPair("last", formatTimestampShort(snapshot.LastCycleCompletedAt), "white", ""),
@@ -341,6 +342,7 @@ func (renderer *Renderer) buildScreenChrome(
 				renderer.shortcutPair("q/Esc", "quit"),
 				renderer.shortcutPair("p", "pause"),
 				renderer.shortcutPair("h", "hide help"),
+				renderer.shortcutPair("f", "fresh check"),
 				renderer.shortcutPair("s", "snapshot"),
 				renderer.shortcutPair("r", "reset"),
 				renderer.shortcutPair("u", "updates"),
@@ -669,13 +671,14 @@ func (renderer *Renderer) buildTargetTable(statsList []TargetStats, width int, c
 
 	lines := []string{renderer.style("Targets", "cyan", true, false)}
 	header := fmt.Sprintf(
-		"%3s %-24s %-8s %-10s %9s %6s %*s %*s %-18s  %s",
+		"%3s %-24s %-8s %-10s %9s %6s %7s %*s %*s %-18s  %s",
 		"Idx",
 		"Target",
 		"Type",
 		"State",
 		"Latency",
 		"Consec",
+		"Age",
 		lossWidth,
 		lossHeader,
 		ratioWidth,
@@ -690,8 +693,9 @@ func (renderer *Renderer) buildTargetTable(statsList []TargetStats, width int, c
 	}
 
 	for index, stats := range statsList {
-		statePlain := fmt.Sprintf("%-10s", strings.ToLower(stats.LastResult))
-		stateText := renderer.style(statePlain, renderer.stateColor(stats), stats.LastState == "down", false)
+		stateLabel := renderer.targetStateLabel(stats, config)
+		statePlain := fmt.Sprintf("%-10s", stateLabel)
+		stateText := renderer.style(statePlain, renderer.stateColor(stats, config), stats.LastState == "down" && !stats.Checking, false)
 		latencyColor := renderer.latencyColor(stats.LastLatencyMS, config)
 		latencyText := renderer.style(fmt.Sprintf("%9s", formatLatency(stats.LastLatencyMS)), latencyColor, latencyColor == "red", false)
 		consecutiveText := renderer.style(
@@ -712,6 +716,7 @@ func (renderer *Renderer) buildTargetTable(statsList []TargetStats, width int, c
 			false,
 			false,
 		)
+		ageText := renderer.style(fmt.Sprintf("%7s", renderer.targetAge(stats)), renderer.targetAgeColor(stats, config), false, false)
 		errorText := "-"
 		if stats.LastErrorCategory != "" && stats.LastErrorCategory != "ok" {
 			errorText = stats.LastErrorCategory
@@ -719,20 +724,21 @@ func (renderer *Renderer) buildTargetTable(statsList []TargetStats, width int, c
 				errorText = stats.LastErrorCategory + ": " + stats.LastErrorMessage
 			}
 		}
-		fixedWidth := 3 + 1 + 24 + 1 + 8 + 1 + 10 + 1 + 9 + 1 + 6 + 1 + lossWidth + 1 + ratioWidth + 1 + 18 + 2
+		fixedWidth := 3 + 1 + 24 + 1 + 8 + 1 + 10 + 1 + 9 + 1 + 6 + 1 + 7 + 1 + lossWidth + 1 + ratioWidth + 1 + 18 + 2
 		errorText = shorten(errorText, maxInt(10, width-fixedWidth))
 		if errorText != "-" {
 			errorText = renderer.style(errorText, "red", true, false)
 		}
 
 		line := fmt.Sprintf(
-			"%3d %-24s %-8s %s %s %s %s %s %-18s  %s",
+			"%3d %-24s %-8s %s %s %s %s %s %s %-18s  %s",
 			index+1,
 			shorten(stats.Target, 24),
 			stats.TargetType,
 			stateText,
 			latencyText,
 			consecutiveText,
+			ageText,
 			lossText,
 			okFailText,
 			shorten(defaultString(stats.LastResolvedIP, "-"), 18),
@@ -809,7 +815,34 @@ func (renderer *Renderer) isInterestingEvent(event EventEntry) bool {
 	return strings.Contains(event.Message, " recovered (")
 }
 
-func (renderer *Renderer) stateColor(stats TargetStats) string {
+func (renderer *Renderer) activeCycleText(status pingtop.CycleStatus) string {
+	if !status.Active {
+		return "idle"
+	}
+	return fmt.Sprintf("cycle %d %d/%d", status.CycleID, status.CompletedChecks, status.TotalChecks)
+}
+
+func (renderer *Renderer) activeCycleColor(status pingtop.CycleStatus) string {
+	if status.Active {
+		return "yellow"
+	}
+	return "green"
+}
+
+func (renderer *Renderer) targetStateLabel(stats TargetStats, config AppConfig) string {
+	if stats.Checking {
+		return "checking"
+	}
+	if renderer.targetIsStale(stats, config) {
+		return "stale"
+	}
+	return strings.ToLower(defaultString(stats.LastResult, "pending"))
+}
+
+func (renderer *Renderer) stateColor(stats TargetStats, config AppConfig) string {
+	if stats.Checking || renderer.targetIsStale(stats, config) {
+		return "yellow"
+	}
 	if stats.LastState == "up" {
 		return "green"
 	}
@@ -817,6 +850,32 @@ func (renderer *Renderer) stateColor(stats TargetStats) string {
 		return "red"
 	}
 	return "yellow"
+}
+
+func (renderer *Renderer) targetAge(stats TargetStats) string {
+	if stats.LastCheckedAt.IsZero() {
+		return "-"
+	}
+	ageSeconds := timeNow().Sub(stats.LastCheckedAt).Seconds()
+	if ageSeconds < 0 {
+		ageSeconds = 0
+	}
+	return formatDuration(ageSeconds)
+}
+
+func (renderer *Renderer) targetAgeColor(stats TargetStats, config AppConfig) string {
+	if stats.Checking || renderer.targetIsStale(stats, config) {
+		return "yellow"
+	}
+	return ""
+}
+
+func (renderer *Renderer) targetIsStale(stats TargetStats, config AppConfig) bool {
+	if stats.Checking || stats.LastCheckedAt.IsZero() {
+		return false
+	}
+	staleAfter := config.CheckIntervalSeconds + float64(config.PingTimeoutMS)/1000.0 + maxFloat(1.0, config.UIRefreshIntervalSeconds*2.0)
+	return timeNow().Sub(stats.LastCheckedAt).Seconds() > staleAfter
 }
 
 func (renderer *Renderer) latencyColor(latencyMS *float64, config AppConfig) string {
@@ -899,6 +958,13 @@ func minInt(left, right int) int {
 }
 
 func maxInt(left, right int) int {
+	if left > right {
+		return left
+	}
+	return right
+}
+
+func maxFloat(left, right float64) float64 {
 	if left > right {
 		return left
 	}

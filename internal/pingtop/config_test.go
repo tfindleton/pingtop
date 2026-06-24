@@ -112,6 +112,9 @@ func TestConfigManagerWritesDefaultsAndRecoversFromBadJSON(t *testing.T) {
 	if first := manager.Snapshot().Targets[0].Value; first != "1.1.1.1" {
 		t.Fatalf("unexpected first default target: %q", first)
 	}
+	if got := manager.Snapshot().UIRefreshIntervalSeconds; got != 1.0 {
+		t.Fatalf("unexpected default UI refresh interval: %.2f", got)
+	}
 
 	if err := os.WriteFile(path, []byte("{not json"), 0o644); err != nil {
 		t.Fatalf("failed to write bad json: %v", err)

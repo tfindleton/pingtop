@@ -11,7 +11,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/tfindleton/pingtop/internal/pingtop"
@@ -44,13 +43,20 @@ func NewPingRunner() *PingRunner {
 }
 
 func (runner *PingRunner) Ping(ipAddress string, timeoutMS int) (bool, *float64, string, string) {
+	return runner.PingContext(context.Background(), ipAddress, timeoutMS)
+}
+
+func (runner *PingRunner) PingContext(parent context.Context, ipAddress string, timeoutMS int) (bool, *float64, string, string) {
+	if err := parent.Err(); err != nil {
+		return false, nil, "canceled", err.Error()
+	}
 	if success, latencyMS, errorCategory, errorMessage, handled := nativePing(ipAddress, timeoutMS); handled {
 		return success, latencyMS, errorCategory, errorMessage
 	}
 
 	command := runner.buildCommand(ipAddress, timeoutMS)
 	timeout := time.Duration(math.Max(3.0, float64(timeoutMS)/1000.0+2.0) * float64(time.Second))
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
 	started := time.Now()
@@ -73,6 +79,9 @@ func (runner *PingRunner) Ping(ipAddress string, timeoutMS int) (bool, *float64,
 
 	if ctx.Err() == context.DeadlineExceeded {
 		return false, nil, "timeout", fmt.Sprintf("ping command exceeded %d ms timeout", timeoutMS)
+	}
+	if ctx.Err() != nil {
+		return false, nil, "canceled", ctx.Err().Error()
 	}
 
 	var execErr *exec.Error
@@ -149,7 +158,11 @@ func NewDNSResolver(lookupFunc DNSLookupFunc) *DNSResolver {
 }
 
 func (resolver *DNSResolver) Resolve(hostname string, timeoutMS int) (bool, string, string) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMS)*time.Millisecond)
+	return resolver.ResolveContext(context.Background(), hostname, timeoutMS)
+}
+
+func (resolver *DNSResolver) ResolveContext(parent context.Context, hostname string, timeoutMS int) (bool, string, string) {
+	ctx, cancel := context.WithTimeout(parent, time.Duration(timeoutMS)*time.Millisecond)
 	defer cancel()
 
 	resultCh := make(chan dnsLookupResult, 1)
@@ -208,6 +221,11 @@ type CheckCoordinator struct {
 	dnsResolver *DNSResolver
 }
 
+type cycleResult struct {
+	index  int
+	result CheckResult
+}
+
 func NewCheckCoordinator(pingRunner *PingRunner, dnsResolver *DNSResolver) *CheckCoordinator {
 	if dnsResolver == nil {
 		dnsResolver = defaultDNSResolver
@@ -225,23 +243,40 @@ func (coordinator *CheckCoordinator) Close() {
 }
 
 func (coordinator *CheckCoordinator) ExecuteCycle(config AppConfig, cycleID int) []CheckResult {
+	return coordinator.ExecuteCycleContext(context.Background(), config, cycleID, nil)
+}
+
+func (coordinator *CheckCoordinator) ExecuteCycleContext(ctx context.Context, config AppConfig, cycleID int, onProgress func()) []CheckResult {
 	if len(config.Targets) == 0 {
 		return nil
 	}
 	results := make([]CheckResult, len(config.Targets))
-	var waitGroup sync.WaitGroup
+	resultCh := make(chan cycleResult, len(config.Targets))
 	for index, target := range config.Targets {
-		waitGroup.Add(1)
 		go func(index int, target TargetSpec) {
-			defer waitGroup.Done()
-			results[index] = coordinator.safeCheckTarget(target, config.PingTimeoutMS, cycleID, fmt.Sprintf("worker-%d", index+1))
+			result := coordinator.safeCheckTarget(ctx, target, config.PingTimeoutMS, cycleID, fmt.Sprintf("worker-%d", index+1))
+			select {
+			case resultCh <- cycleResult{index: index, result: result}:
+			case <-ctx.Done():
+			}
 		}(index, target)
 	}
-	waitGroup.Wait()
+
+	for completed := 0; completed < len(config.Targets); completed++ {
+		select {
+		case item := <-resultCh:
+			results[item.index] = item.result
+			if onProgress != nil {
+				onProgress()
+			}
+		case <-ctx.Done():
+			return nil
+		}
+	}
 	return results
 }
 
-func (coordinator *CheckCoordinator) safeCheckTarget(target TargetSpec, timeoutMS, cycleID int, workerID string) (result CheckResult) {
+func (coordinator *CheckCoordinator) safeCheckTarget(ctx context.Context, target TargetSpec, timeoutMS, cycleID int, workerID string) (result CheckResult) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			var dnsSuccess *bool
@@ -262,12 +297,15 @@ func (coordinator *CheckCoordinator) safeCheckTarget(target TargetSpec, timeoutM
 			}
 		}
 	}()
-	return coordinator.checkTarget(target, timeoutMS, cycleID, workerID)
+	return coordinator.checkTarget(ctx, target, timeoutMS, cycleID, workerID)
 }
 
-func (coordinator *CheckCoordinator) checkTarget(target TargetSpec, timeoutMS, cycleID int, workerID string) CheckResult {
+func (coordinator *CheckCoordinator) checkTarget(ctx context.Context, target TargetSpec, timeoutMS, cycleID int, workerID string) CheckResult {
+	if err := ctx.Err(); err != nil {
+		return canceledResult(target, cycleID, workerID, err)
+	}
 	if target.Kind == "ip" {
-		pingSuccess, latencyMS, errorCategory, errorMessage := coordinator.pingRunner.Ping(target.Value, timeoutMS)
+		pingSuccess, latencyMS, errorCategory, errorMessage := coordinator.pingRunner.PingContext(ctx, target.Value, timeoutMS)
 		return CheckResult{
 			CycleID:       cycleID,
 			Timestamp:     time.Now(),
@@ -283,7 +321,7 @@ func (coordinator *CheckCoordinator) checkTarget(target TargetSpec, timeoutMS, c
 		}
 	}
 
-	dnsSuccess, resolvedIP, dnsError := coordinator.dnsResolver.Resolve(target.Value, timeoutMS)
+	dnsSuccess, resolvedIP, dnsError := coordinator.dnsResolver.ResolveContext(ctx, target.Value, timeoutMS)
 	if !dnsSuccess {
 		category := "dns_failure"
 		lowered := strings.ToLower(dnsError)
@@ -305,7 +343,7 @@ func (coordinator *CheckCoordinator) checkTarget(target TargetSpec, timeoutMS, c
 		}
 	}
 
-	pingSuccess, latencyMS, errorCategory, errorMessage := coordinator.pingRunner.Ping(resolvedIP, timeoutMS)
+	pingSuccess, latencyMS, errorCategory, errorMessage := coordinator.pingRunner.PingContext(ctx, resolvedIP, timeoutMS)
 	return CheckResult{
 		CycleID:       cycleID,
 		Timestamp:     time.Now(),
@@ -323,6 +361,26 @@ func (coordinator *CheckCoordinator) checkTarget(target TargetSpec, timeoutMS, c
 
 func resolveHostname(hostname string, timeoutMS int) (bool, string, string) {
 	return defaultDNSResolver.Resolve(hostname, timeoutMS)
+}
+
+func canceledResult(target TargetSpec, cycleID int, workerID string, err error) CheckResult {
+	var dnsSuccess *bool
+	if target.Kind != "ip" {
+		dnsSuccess = boolPtr(false)
+	}
+	return CheckResult{
+		CycleID:       cycleID,
+		Timestamp:     time.Now(),
+		Target:        target.Value,
+		TargetType:    target.Kind,
+		ResolvedIP:    fallbackResolvedIP(target),
+		DNSSuccess:    dnsSuccess,
+		PingSuccess:   false,
+		LatencyMS:     nil,
+		ErrorCategory: "canceled",
+		ErrorMessage:  shorten(err.Error(), 180),
+		WorkerID:      workerID,
+	}
 }
 
 func chooseOKCategory(success bool, category string) string {

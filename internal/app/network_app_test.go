@@ -248,13 +248,46 @@ func TestRefreshKeysDecreaseAndIncreaseRefreshInterval(t *testing.T) {
 	)
 
 	ui.handleKey("<")
-	if got := services.configManager.Snapshot().UIRefreshIntervalSeconds; got != 0.4 {
-		t.Fatalf("expected < to decrease refresh interval to 0.40s, got %.2f", got)
+	if got := services.configManager.Snapshot().UIRefreshIntervalSeconds; got != 0.9 {
+		t.Fatalf("expected < to decrease refresh interval to 0.90s, got %.2f", got)
 	}
 
 	ui.handleKey(">")
-	if got := services.configManager.Snapshot().UIRefreshIntervalSeconds; got != 0.5 {
-		t.Fatalf("expected > to increase refresh interval to 0.50s, got %.2f", got)
+	if got := services.configManager.Snapshot().UIRefreshIntervalSeconds; got != 1.0 {
+		t.Fatalf("expected > to increase refresh interval to 1.00s, got %.2f", got)
+	}
+}
+
+func TestHandleKeyFForcesFreshCheck(t *testing.T) {
+	tempDir := t.TempDir()
+	services, err := buildServices(pingtop.RuntimePaths{
+		ConfigPath: filepath.Join(tempDir, "pingtop.json"),
+		LogPath:    filepath.Join(tempDir, "pingtop_log.csv"),
+	}, cliArgs{})
+	if err != nil {
+		t.Fatalf("unexpected buildServices error: %v", err)
+	}
+	defer services.coordinator.Close()
+
+	ui := NewPingTopUI(
+		services.runtimePaths,
+		services.configManager,
+		services.stateStore,
+		services.logger,
+		services.coordinator,
+		services.updateManager,
+	)
+	services.stateStore.BeginCycle(99, 0, services.configManager.Snapshot(), time.Now())
+	ui.handleKey("f")
+
+	if services.stateStore.Snapshot().ActiveCycle.Active {
+		t.Fatal("expected force refresh to clear the active cycle")
+	}
+	if len(ui.monitor.wakeCh) != 1 {
+		t.Fatal("expected force refresh key to wake the background monitor")
+	}
+	if message := latestEventMessage(services.stateStore); !strings.Contains(message, "Forced fresh check cycle") {
+		t.Fatalf("expected force refresh event, got %q", message)
 	}
 }
 
