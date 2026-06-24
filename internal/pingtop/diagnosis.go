@@ -1,13 +1,20 @@
 package pingtop
 
-import "math"
+import (
+	"math"
+	"strings"
+)
 
 func diagnoseCycle(results []CheckResult, config AppConfig) DiagnosisAssessment {
-	if len(config.Targets) == 0 {
+	if config.EnabledTargetCount() == 0 {
+		message := "No targets configured"
+		if len(config.Targets) > 0 {
+			message = "No targets enabled"
+		}
 		return DiagnosisAssessment{
 			Key:              "no_targets",
-			ConfirmedMessage: "No targets configured",
-			SuspectedMessage: "no targets configured",
+			ConfirmedMessage: message,
+			SuspectedMessage: strings.ToLower(message),
 		}
 	}
 	if len(results) == 0 {

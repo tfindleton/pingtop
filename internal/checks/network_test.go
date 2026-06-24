@@ -89,6 +89,21 @@ func TestExecuteCycleContextReturnsPromptlyWhenCanceled(t *testing.T) {
 	}
 }
 
+func TestExecuteCycleContextSkipsDisabledTargets(t *testing.T) {
+	coordinator := NewCheckCoordinator(NewPingRunner(), nil)
+	defer coordinator.Close()
+
+	results := coordinator.ExecuteCycleContext(context.Background(), AppConfig{
+		PingTimeoutMS: 1200,
+		Targets: []TargetSpec{
+			{Value: "disabled.example", Kind: "hostname", Disabled: true},
+		},
+	}, 1, nil)
+	if results != nil {
+		t.Fatalf("expected disabled-only cycle to return nil results, got %#v", results)
+	}
+}
+
 func equalStrings(left, right []string) bool {
 	if len(left) != len(right) {
 		return false

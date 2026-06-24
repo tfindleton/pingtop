@@ -87,17 +87,20 @@ pingtop --check-updates --current-version 0.1.3 --update-repo https://github.com
 
 ## Controls
 
-The interactive UI starts with help visible by default and remembers the last help visibility choice in `pingtop.json`. Press `h` to show or hide the full help panel.
+The interactive UI starts with help and events visible and target details hidden by default. It remembers those visibility choices in `pingtop.json`.
+
+Runtime files are written next to the `pingtop` executable: `pingtop.json` for targets and settings, `pingtop_log.csv` for CSV logs, and `pingtop_snapshot_*.txt` for snapshots. When running with `go run`, pingtop uses the launch/current directory instead of Go's temporary build directory.
 
 **Controls**
 - `q` or `Esc`: quit
 - `p`: pause or resume
 - `h`: show or hide help
+- `i`: show or hide selected-target details
+- `e`: show or hide events
 - `f`: force a fresh check cycle
 - `s`: save a snapshot
 - `r`: reset session counters
 - `u`: open the release page
-- `Up` / `Down`: scroll older or newer events
 - `PgUp` / `PgDn`: page through event history
 
 **Tuning**
@@ -109,7 +112,10 @@ The interactive UI starts with help visible by default and remembers the last he
 
 **Targets**
 - `a`: add a target
-- `d`: delete a target
+- `d`: confirm deleting the selected target
+- `D`: delete by target index or exact target
+- `Up` / `Down` or `j` / `k`: move the target selector
+- `Space` or `Enter`: enable or disable the selected target
 
 ## Release Flow
 

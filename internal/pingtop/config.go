@@ -54,6 +54,8 @@ type AppConfig struct {
 	PingTimeoutMS            int          `json:"ping_timeout_ms"`
 	UIRefreshIntervalSeconds float64      `json:"ui_refresh_interval_seconds"`
 	HelpVisible              bool         `json:"help_visible"`
+	DetailsVisible           bool         `json:"details_visible"`
+	EventsVisible            bool         `json:"events_visible"`
 	StatsWindowSeconds       int          `json:"stats_window_seconds"`
 	UpdateCheckEnabled       bool         `json:"update_check_enabled"`
 	UpdateRepoURL            string       `json:"update_repo_url"`
@@ -85,6 +87,8 @@ func defaultConfig() AppConfig {
 		PingTimeoutMS:            1200,
 		UIRefreshIntervalSeconds: 1.0,
 		HelpVisible:              true,
+		DetailsVisible:           false,
+		EventsVisible:            true,
 		StatsWindowSeconds:       3600,
 		UpdateCheckEnabled:       true,
 		UpdateRepoURL:            DefaultUpdateRepoURL,
@@ -107,6 +111,27 @@ func (config AppConfig) Clone() AppConfig {
 	clone := config
 	clone.Targets = append([]TargetSpec(nil), config.Targets...)
 	return clone
+}
+
+func (config AppConfig) EnabledTargets() []TargetSpec {
+	targets := make([]TargetSpec, 0, len(config.Targets))
+	for _, target := range config.Targets {
+		if target.Disabled {
+			continue
+		}
+		targets = append(targets, target)
+	}
+	return targets
+}
+
+func (config AppConfig) EnabledTargetCount() int {
+	count := 0
+	for _, target := range config.Targets {
+		if !target.Disabled {
+			count++
+		}
+	}
+	return count
 }
 
 func (config *AppConfig) Normalize() {
@@ -140,6 +165,7 @@ func (config *AppConfig) Normalize() {
 		if err != nil {
 			continue
 		}
+		normalized.Disabled = target.Disabled
 		key := normalized.Kind + ":" + normalized.Value
 		if _, exists := seen[key]; exists {
 			continue
@@ -303,6 +329,8 @@ func configFromMap(data map[string]any) AppConfig {
 		PingTimeoutMS:            asInt(data["ping_timeout_ms"], base.PingTimeoutMS),
 		UIRefreshIntervalSeconds: asFloat(data["ui_refresh_interval_seconds"], base.UIRefreshIntervalSeconds),
 		HelpVisible:              asBool(data["help_visible"], base.HelpVisible),
+		DetailsVisible:           asBool(data["details_visible"], base.DetailsVisible),
+		EventsVisible:            asBool(data["events_visible"], base.EventsVisible),
 		StatsWindowSeconds:       asInt(data["stats_window_seconds"], base.StatsWindowSeconds),
 		UpdateCheckEnabled:       asBool(data["update_check_enabled"], base.UpdateCheckEnabled),
 		UpdateRepoURL:            asString(data["update_repo_url"], base.UpdateRepoURL),
@@ -349,6 +377,10 @@ func parseTargetSpec(value any) (TargetSpec, error) {
 		}
 		if rawKind != "" && rawKind != target.Kind {
 			return TargetSpec{}, fmt.Errorf("target type mismatch for %s", rawValue)
+		}
+		target.Disabled = asBool(item["disabled"], false)
+		if _, exists := item["enabled"]; exists {
+			target.Disabled = !asBool(item["enabled"], true)
 		}
 		return target, nil
 	default:

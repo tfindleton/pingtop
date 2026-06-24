@@ -40,6 +40,8 @@ type screenChrome struct {
 	visibleEvents []EventEntry
 	headerLines   []string
 	tableLines    []string
+	detailBlock   []string
+	promptBlock   []string
 	footerBlock   []string
 }
 
@@ -48,6 +50,19 @@ type eventPanelView struct {
 	availableLines int
 	start          int
 	end            int
+}
+
+type targetTableLayout struct {
+	target  int
+	kind    int
+	state   int
+	latency int
+	fail    int
+	age     int
+	loss    int
+	ratio   int
+	ip      int
+	error   int
 }
 
 type Renderer struct {
@@ -146,11 +161,28 @@ func (renderer *Renderer) BuildScreen(
 	config AppConfig,
 	paused bool,
 	helpVisible bool,
+	detailsVisible bool,
+	eventsVisible bool,
 	prompt *PromptState,
 	updateStatus UpdateStatus,
 	eventScrollOffset int,
 ) string {
-	chrome, eventView := renderer.buildScreenLayout(snapshot, config, paused, helpVisible, updateStatus, eventScrollOffset)
+	return renderer.BuildScreenWithSelection(snapshot, config, paused, helpVisible, detailsVisible, eventsVisible, prompt, updateStatus, eventScrollOffset, -1)
+}
+
+func (renderer *Renderer) BuildScreenWithSelection(
+	snapshot StateSnapshot,
+	config AppConfig,
+	paused bool,
+	helpVisible bool,
+	detailsVisible bool,
+	eventsVisible bool,
+	prompt *PromptState,
+	updateStatus UpdateStatus,
+	eventScrollOffset int,
+	selectedTargetIndex int,
+) string {
+	chrome, eventView := renderer.buildScreenLayoutWithSelection(snapshot, config, paused, helpVisible, detailsVisible, eventsVisible, updateStatus, eventScrollOffset, selectedTargetIndex, prompt)
 	topCapacity := maxInt(0, chrome.height-len(chrome.footerBlock))
 	middleCapacity := chrome.middleCapacity()
 	middleLines := make([]string, 0, middleCapacity)
@@ -160,6 +192,22 @@ func (renderer *Renderer) BuildScreen(
 	} else {
 		middleLines = append(middleLines, chrome.tableLines...)
 		remaining := middleCapacity - len(chrome.tableLines)
+		if len(chrome.detailBlock) > 0 && remaining > 0 {
+			detailLines := chrome.detailBlock
+			if len(detailLines) > remaining {
+				detailLines = detailLines[:remaining]
+			}
+			middleLines = append(middleLines, detailLines...)
+			remaining -= len(detailLines)
+		}
+		if len(chrome.promptBlock) > 0 && remaining > 0 {
+			promptLines := chrome.promptBlock
+			if len(promptLines) > remaining {
+				promptLines = promptLines[:remaining]
+			}
+			middleLines = append(middleLines, promptLines...)
+			remaining -= len(promptLines)
+		}
 		if remaining >= 3 && eventView.availableLines > 0 {
 			eventLines := renderer.buildEventPanel(eventView.events, chrome.width, eventView.start, eventView.end, true)
 			eventBlock := []string{renderer.rule(chrome.width, "-"), eventTitle}
@@ -183,9 +231,6 @@ func (renderer *Renderer) BuildScreen(
 	}
 
 	lines := append(topLines, chrome.footerBlock...)
-	if prompt != nil {
-		lines = renderer.overlayPrompt(lines, chrome.width, chrome.height, *prompt)
-	}
 	if len(lines) > chrome.height {
 		lines = lines[:chrome.height]
 	}
@@ -197,11 +242,13 @@ func (renderer *Renderer) EventScrollState(
 	config AppConfig,
 	paused bool,
 	helpVisible bool,
+	detailsVisible bool,
+	eventsVisible bool,
 	prompt *PromptState,
 	updateStatus UpdateStatus,
 	eventScrollOffset int,
 ) (int, int) {
-	_, view := renderer.buildScreenLayout(snapshot, config, paused, helpVisible, updateStatus, eventScrollOffset)
+	_, view := renderer.buildScreenLayoutWithSelection(snapshot, config, paused, helpVisible, detailsVisible, eventsVisible, updateStatus, eventScrollOffset, -1, prompt)
 	pageSize := view.availableLines
 	if pageSize < 1 {
 		pageSize = maxInt(3, config.VisibleEventLines)
@@ -243,7 +290,7 @@ func (renderer *Renderer) BuildReport(snapshot StateSnapshot, config AppConfig, 
 		"",
 	}
 	visibleEvents := renderer.visibleEvents(snapshot.RecentEvents, config)
-	body := renderer.buildTargetTable(snapshot.TargetStats, width, config, false)
+	body := renderer.buildTargetTable(snapshot.TargetStats, width, config, false, -1)
 	events := []string{"", "Recent events"}
 	shownLines := minInt(15, config.VisibleEventLines)
 	start := maxInt(0, len(visibleEvents)-shownLines)
@@ -256,8 +303,12 @@ func (renderer *Renderer) buildScreenChrome(
 	config AppConfig,
 	paused bool,
 	helpVisible bool,
+	detailsVisible bool,
+	eventsVisible bool,
 	updateStatus UpdateStatus,
 	eventStatus string,
+	selectedTargetIndex int,
+	prompt *PromptState,
 ) screenChrome {
 	width, height := terminalSize()
 	if width < 40 {
@@ -278,10 +329,17 @@ func (renderer *Renderer) buildScreenChrome(
 	}
 
 	visibleEvents := renderer.visibleEvents(snapshot.RecentEvents, config)
+	if !eventsVisible {
+		visibleEvents = nil
+	}
 	statusColor := renderer.diagnosisColor(snapshot.Diagnosis, paused)
 	title := "pingtop " + pingtop.Version
 	if eventStatus == "" {
-		eventStatus = fmt.Sprintf("%d total", len(visibleEvents))
+		if eventsVisible {
+			eventStatus = fmt.Sprintf("%d total", len(visibleEvents))
+		} else {
+			eventStatus = "hidden"
+		}
 	}
 
 	headerLines := []string{renderer.style(title, "green", true, false)}
@@ -289,7 +347,6 @@ func (renderer *Renderer) buildScreenChrome(
 	headerLines = append(headerLines,
 		renderer.wrapPairs("Status", []textPair{
 			renderer.kvPair("mode", status, "white", statusColor),
-			renderer.kvPair("active", renderer.activeCycleText(snapshot.ActiveCycle), "white", renderer.activeCycleColor(snapshot.ActiveCycle)),
 			renderer.kvPair("update", renderer.updateStatusText(updateStatus), "white", renderer.updateStatusColor(updateStatus)),
 			renderer.kvPair("events", eventStatus, "white", ""),
 			renderer.kvPair("last", formatTimestampShort(snapshot.LastCycleCompletedAt), "white", ""),
@@ -300,7 +357,7 @@ func (renderer *Renderer) buildScreenChrome(
 			renderer.kvPair("check", formatDuration(config.CheckIntervalSeconds), "white", ""),
 			renderer.kvPair("timeout", fmt.Sprintf("%dms", config.PingTimeoutMS), "white", ""),
 			renderer.kvPair("refresh", formatDuration(config.UIRefreshIntervalSeconds), "white", ""),
-			renderer.kvPair("targets", fmt.Sprintf("%d", len(config.Targets)), "white", ""),
+			renderer.kvPair("targets", fmt.Sprintf("%d/%d", config.EnabledTargetCount(), len(config.Targets)), "white", ""),
 		}, width, "cyan")...,
 	)
 	headerLines = append(headerLines,
@@ -331,9 +388,15 @@ func (renderer *Renderer) buildScreenChrome(
 			renderer.kvPair("ping", abbreviateCount(snapshot.Session.PingFailures), "white", "yellow"),
 		}, width, "cyan")...,
 	)
+	headerLines = append(headerLines, renderer.buildFocusLine(snapshot, config, selectedTargetIndex, prompt, width)...)
 	headerLines = append(headerLines, renderer.rule(width, "="))
 
-	tableLines := renderer.buildTargetTable(snapshot.TargetStats, width, config, true)
+	tableLines := renderer.buildTargetTable(snapshot.TargetStats, width, config, true, selectedTargetIndex)
+	var detailBlock []string
+	if detailsVisible {
+		detailBlock = renderer.buildTargetDetailsBlock(snapshot.TargetStats, config, selectedTargetIndex, width)
+	}
+	promptBlock := renderer.buildPromptPanel(prompt, width)
 
 	footerLines := make([]string, 0)
 	if helpVisible {
@@ -342,6 +405,7 @@ func (renderer *Renderer) buildScreenChrome(
 				renderer.shortcutPair("q/Esc", "quit"),
 				renderer.shortcutPair("p", "pause"),
 				renderer.shortcutPair("h", "hide help"),
+				renderer.shortcutPair("i", "details"),
 				renderer.shortcutPair("f", "fresh check"),
 				renderer.shortcutPair("s", "snapshot"),
 				renderer.shortcutPair("r", "reset"),
@@ -361,13 +425,18 @@ func (renderer *Renderer) buildScreenChrome(
 			renderer.wrapPairs("Targets", []textPair{
 				renderer.shortcutPair("a", "add"),
 				renderer.shortcutPair("d", "delete"),
+				renderer.shortcutPair("Up/Down/j/k", "select"),
+				renderer.shortcutPair("Space/Enter", "toggle"),
 			}, width, "cyan")...,
 		)
+		eventShortcuts := []textPair{
+			renderer.shortcutPair("e", ternaryString(eventsVisible, "hide", "show")),
+		}
+		if eventsVisible {
+			eventShortcuts = append(eventShortcuts, renderer.shortcutPair("PgUp/PgDn", "page"))
+		}
 		footerLines = append(footerLines,
-			renderer.wrapPairs("Events", []textPair{
-				renderer.shortcutPair("Up/Down", "scroll"),
-				renderer.shortcutPair("PgUp/PgDn", "page"),
-			}, width, "cyan")...,
+			renderer.wrapPairs("Events", eventShortcuts, width, "cyan")...,
 		)
 	} else {
 		footerLines = append(footerLines,
@@ -387,6 +456,8 @@ func (renderer *Renderer) buildScreenChrome(
 		visibleEvents: visibleEvents,
 		headerLines:   headerLines,
 		tableLines:    tableLines,
+		detailBlock:   detailBlock,
+		promptBlock:   promptBlock,
 		footerBlock:   footerBlock,
 	}
 }
@@ -399,14 +470,32 @@ func (renderer *Renderer) buildScreenLayout(
 	updateStatus UpdateStatus,
 	eventScrollOffset int,
 ) (screenChrome, eventPanelView) {
-	chrome := renderer.buildScreenChrome(snapshot, config, paused, helpVisible, updateStatus, "")
+	return renderer.buildScreenLayoutWithSelection(snapshot, config, paused, helpVisible, false, true, updateStatus, eventScrollOffset, -1, nil)
+}
+
+func (renderer *Renderer) buildScreenLayoutWithSelection(
+	snapshot StateSnapshot,
+	config AppConfig,
+	paused bool,
+	helpVisible bool,
+	detailsVisible bool,
+	eventsVisible bool,
+	updateStatus UpdateStatus,
+	eventScrollOffset int,
+	selectedTargetIndex int,
+	prompt *PromptState,
+) (screenChrome, eventPanelView) {
+	chrome := renderer.buildScreenChrome(snapshot, config, paused, helpVisible, detailsVisible, eventsVisible, updateStatus, "", selectedTargetIndex, prompt)
+	if !eventsVisible {
+		return chrome, eventPanelView{}
+	}
 	view := renderer.buildEventPanelView(chrome, config, eventScrollOffset)
 	eventStatus := fmt.Sprintf("%d/%d", view.shownCount(), len(chrome.visibleEvents))
-	chrome = renderer.buildScreenChrome(snapshot, config, paused, helpVisible, updateStatus, eventStatus)
+	chrome = renderer.buildScreenChrome(snapshot, config, paused, helpVisible, detailsVisible, eventsVisible, updateStatus, eventStatus, selectedTargetIndex, prompt)
 	view = renderer.buildEventPanelView(chrome, config, eventScrollOffset)
 	finalStatus := fmt.Sprintf("%d/%d", view.shownCount(), len(chrome.visibleEvents))
 	if finalStatus != eventStatus {
-		chrome = renderer.buildScreenChrome(snapshot, config, paused, helpVisible, updateStatus, finalStatus)
+		chrome = renderer.buildScreenChrome(snapshot, config, paused, helpVisible, detailsVisible, eventsVisible, updateStatus, finalStatus, selectedTargetIndex, prompt)
 		view = renderer.buildEventPanelView(chrome, config, eventScrollOffset)
 	}
 	return chrome, view
@@ -424,6 +513,12 @@ func (renderer *Renderer) buildEventPanelView(chrome screenChrome, config AppCon
 	}
 
 	remaining := chrome.middleCapacity() - len(chrome.tableLines)
+	if len(chrome.detailBlock) > 0 {
+		remaining -= minInt(remaining, len(chrome.detailBlock))
+	}
+	if len(chrome.promptBlock) > 0 {
+		remaining -= minInt(remaining, len(chrome.promptBlock))
+	}
 	if remaining < 5 {
 		return view
 	}
@@ -572,60 +667,162 @@ func (renderer *Renderer) wrapPairs(label string, segments []textPair, width int
 	return wrapped
 }
 
-func (renderer *Renderer) overlayPrompt(lines []string, width, height int, prompt PromptState) []string {
-	padded := append([]string(nil), lines...)
-	for len(padded) < height {
-		padded = append(padded, "")
+func (renderer *Renderer) buildFocusLine(snapshot StateSnapshot, config AppConfig, selectedTargetIndex int, prompt *PromptState, width int) []string {
+	if len(config.Targets) == 0 && prompt == nil {
+		return nil
 	}
-	boxWidth := minInt(maxInt(46, width-10), 88)
-	boxWidth = minInt(boxWidth, maxInt(28, width-2))
-	innerWidth := maxInt(18, boxWidth-4)
-	boxHeight := 7
-	if height < boxHeight+2 {
-		return padded
+	segments := make([]textPair, 0, 4)
+	if selectedTargetIndex >= 0 && selectedTargetIndex < len(snapshot.TargetStats) {
+		stats := snapshot.TargetStats[selectedTargetIndex]
+		segments = append(segments,
+			renderer.kvPair("selected", fmt.Sprintf("%d/%d", selectedTargetIndex+1, len(snapshot.TargetStats)), "white", "yellow"),
+			renderer.kvPair("target", shorten(stats.Target, 40), "white", ""),
+			renderer.kvPair("state", renderer.targetStateLabel(stats, config), "white", renderer.stateColor(stats, config)),
+		)
+	} else {
+		segments = append(segments, renderer.kvPair("selected", "-", "white", ""))
+	}
+	if prompt != nil {
+		segments = append(segments, renderer.kvPair("command", renderer.promptTitle(prompt.Kind), "white", "magenta"))
+	}
+	return renderer.wrapPairs("Focus", segments, width, "magenta")
+}
+
+func (renderer *Renderer) buildTargetDetailsBlock(statsList []TargetStats, config AppConfig, selectedTargetIndex int, width int) []string {
+	if selectedTargetIndex < 0 || selectedTargetIndex >= len(statsList) {
+		return nil
+	}
+	stats := statsList[selectedTargetIndex]
+	status := "enabled"
+	statusColor := "green"
+	if stats.Disabled {
+		status = "disabled"
+		statusColor = "white"
+	}
+
+	lines := []string{renderer.rule(width, "-")}
+	lines = append(lines, renderer.sectionTitle("Details", fmt.Sprintf("selected %d/%d", selectedTargetIndex+1, len(statsList)), width))
+	lines = append(lines, renderer.wrapPairs("Target", []textPair{
+		renderer.kvPair("value", stats.Target, "white", ""),
+		renderer.kvPair("type", stats.TargetType, "white", ""),
+		renderer.kvPair("status", status, "white", statusColor),
+		renderer.kvPair("state", renderer.targetStateLabel(stats, config), "white", renderer.stateColor(stats, config)),
+	}, width, "cyan")...)
+	lines = append(lines, renderer.wrapPairs("Stats", []textPair{
+		renderer.kvPair("checks", abbreviateCount(stats.TotalChecks), "white", ""),
+		renderer.kvPair("ok", abbreviateCount(stats.SuccessCount), "white", "green"),
+		renderer.kvPair("fail", abbreviateCount(stats.FailureCount), "white", ternaryString(stats.FailureCount > 0, "red", "green")),
+		renderer.kvPair("dns", abbreviateCount(stats.DNSFailureCount), "white", ternaryString(stats.DNSFailureCount > 0, "yellow", "green")),
+		renderer.kvPair("ping", abbreviateCount(stats.PingFailureCount), "white", ternaryString(stats.PingFailureCount > 0, "yellow", "green")),
+		renderer.kvPair("loss", fmt.Sprintf("%.1f%%", stats.PacketLossPercentage()), "white", renderer.lossColor(stats.PacketLossPercentage())),
+		renderer.kvPair(formatCompactSpan(config.StatsWindowSeconds), abbreviateRatio(stats.WindowSummary.Successes, stats.WindowSummary.Failures), "white", ternaryString(stats.WindowSummary.Failures > 0, "red", "green")),
+	}, width, "cyan")...)
+	lines = append(lines, renderer.wrapPairs("Last", []textPair{
+		renderer.kvPair("result", strings.ToLower(defaultString(stats.LastResult, "pending")), "white", renderer.stateColor(stats, config)),
+		renderer.kvPair("latency", formatLatency(stats.LastLatencyMS), "white", renderer.latencyColor(stats.LastLatencyMS, config)),
+		renderer.kvPair("age", renderer.targetAge(stats), "white", renderer.targetAgeColor(stats, config)),
+		renderer.kvPair("ip", defaultString(stats.LastResolvedIP, "-"), "white", ""),
+		renderer.kvPair("consec_fail", fmt.Sprintf("%d", stats.ConsecutiveFailures), "white", ternaryString(stats.ConsecutiveFailures > 0, "red", "green")),
+	}, width, "cyan")...)
+
+	errorText := renderer.targetErrorText(stats)
+	if errorText == "" {
+		lines = append(lines, renderer.wrapPairs("Error", []textPair{
+			renderer.kvPair("last", "none", "white", "green"),
+		}, width, "cyan")...)
+		return lines
+	}
+	lines = append(lines, renderer.wrapText("Error", errorText, width, "red")...)
+	return lines
+}
+
+func (renderer *Renderer) wrapText(label, text string, width int, color string) []string {
+	prefixPlain := fmt.Sprintf("%-8s ", label)
+	prefixRendered := renderer.style(fmt.Sprintf("%-8s", label), "cyan", true, false) + " "
+	continuation := strings.Repeat(" ", len(prefixPlain))
+	available := maxInt(8, width-len(prefixPlain))
+	words := strings.Fields(text)
+	if len(words) == 0 {
+		return []string{prefixRendered + "-"}
+	}
+
+	lines := make([]string, 0, 2)
+	current := ""
+	for _, word := range words {
+		if len(word) > available {
+			if current != "" {
+				lines = append(lines, current)
+				current = ""
+			}
+			for len(word) > available {
+				lines = append(lines, word[:available])
+				word = word[available:]
+			}
+		}
+		if current == "" {
+			current = word
+			continue
+		}
+		if len(current)+1+len(word) > available {
+			lines = append(lines, current)
+			current = word
+			continue
+		}
+		current += " " + word
+	}
+	if current != "" {
+		lines = append(lines, current)
+	}
+
+	rendered := make([]string, 0, len(lines))
+	for index, line := range lines {
+		prefix := continuation
+		if index == 0 {
+			prefix = prefixRendered
+		}
+		rendered = append(rendered, prefix+renderer.style(line, color, color == "red", false))
+	}
+	return rendered
+}
+
+func (renderer *Renderer) buildPromptPanel(prompt *PromptState, width int) []string {
+	if prompt == nil {
+		return nil
 	}
 
 	title := renderer.promptTitle(prompt.Kind)
-	message := shorten(prompt.Message, innerWidth)
-	visibleInput := renderer.tailShorten(prompt.Buffer, maxInt(1, innerWidth-2))
+	message := shorten(prompt.Message, maxInt(12, width-18))
+	visibleInput := renderer.tailShorten(prompt.Buffer, maxInt(1, width-42))
 	inputLine := "> "
 	if visibleInput == "" {
 		inputLine += "_"
 	} else {
 		inputLine += visibleInput
 	}
-	hint := shorten("Enter submit | Esc cancel | Backspace edit", innerWidth)
+	hint := renderer.promptHint(prompt.Kind)
 
-	boxLines := []string{
-		"+" + strings.Repeat("-", boxWidth-2) + "+",
-		fmt.Sprintf("| %-*s |", innerWidth, shorten(title, innerWidth)),
-		fmt.Sprintf("| %-*s |", innerWidth, message),
-		"|" + strings.Repeat(" ", boxWidth-2) + "|",
-		fmt.Sprintf("| %-*s |", innerWidth, inputLine),
-		fmt.Sprintf("| %-*s |", innerWidth, hint),
-		"+" + strings.Repeat("-", boxWidth-2) + "+",
-	}
-	styledLines := []string{
-		renderer.style(boxLines[0], "magenta", true, false),
-		renderer.style(boxLines[1], "magenta", true, false),
-		renderer.style(boxLines[2], "white", false, false),
-		renderer.style(boxLines[3], "magenta", false, false),
-		renderer.style(boxLines[4], "yellow", true, false),
-		renderer.style(boxLines[5], "cyan", false, false),
-		renderer.style(boxLines[6], "magenta", true, false),
-	}
-
-	top := maxInt(1, (height-boxHeight)/2)
-	left := maxInt(0, (width-boxWidth)/2)
-	rightPadding := maxInt(0, width-left-boxWidth)
-	for index, line := range styledLines {
-		targetIndex := top + index
-		if targetIndex >= len(padded) {
-			break
-		}
-		padded[targetIndex] = strings.Repeat(" ", left) + line + strings.Repeat(" ", rightPadding)
-	}
-	return padded
+	lines := []string{renderer.rule(width, "-")}
+	lines = append(lines, renderer.wrapPairs("Command", []textPair{
+		{
+			plain:    title,
+			rendered: renderer.style(title, "magenta", true, false),
+		},
+		{
+			plain:    message,
+			rendered: renderer.style(message, "white", false, false),
+		},
+	}, width, "magenta")...)
+	lines = append(lines, renderer.wrapPairs("Input", []textPair{
+		{
+			plain:    inputLine,
+			rendered: renderer.style(inputLine, "yellow", true, false),
+		},
+		{
+			plain:    hint,
+			rendered: renderer.style(hint, "cyan", false, false),
+		},
+	}, width, "yellow")...)
+	return lines
 }
 
 func (renderer *Renderer) promptTitle(kind string) string {
@@ -634,6 +831,8 @@ func (renderer *Renderer) promptTitle(kind string) string {
 		return "Add Target"
 	case "delete":
 		return "Delete Target"
+	case "confirm_delete":
+		return "Delete Target"
 	case "window":
 		return "Around-Failure Window"
 	case "stats_window":
@@ -641,6 +840,13 @@ func (renderer *Renderer) promptTitle(kind string) string {
 	default:
 		return "Prompt"
 	}
+}
+
+func (renderer *Renderer) promptHint(kind string) string {
+	if kind == "confirm_delete" {
+		return "Y confirm | N/Esc cancel | D manual delete"
+	}
+	return "Enter submit | Esc cancel | Backspace edit"
 }
 
 func (renderer *Renderer) tailShorten(text string, width int) string {
@@ -656,33 +862,36 @@ func (renderer *Renderer) tailShorten(text string, width int) string {
 	return "..." + text[len(text)-(width-3):]
 }
 
-func (renderer *Renderer) buildTargetTable(statsList []TargetStats, width int, config AppConfig, ansi bool) []string {
+func (renderer *Renderer) buildTargetTable(statsList []TargetStats, width int, config AppConfig, ansi bool, selectedTargetIndex int) []string {
 	previousANSI := renderer.ansi
 	renderer.ansi = ansi
 	defer func() {
 		renderer.ansi = previousANSI
 	}()
 
-	windowLabel := formatCompactSpan(config.StatsWindowSeconds)
-	lossHeader := windowLabel + " Loss%"
-	ratioHeader := windowLabel + " OK/Fail"
-	lossWidth := maxInt(8, len(lossHeader))
-	ratioWidth := maxInt(13, len(ratioHeader))
+	layout := renderer.targetTableLayout(statsList, width, config)
 
 	lines := []string{renderer.style("Targets", "cyan", true, false)}
 	header := fmt.Sprintf(
-		"%3s %-24s %-8s %-10s %9s %6s %7s %*s %*s %-18s  %s",
+		"%3s %-*s %-*s %-*s %*s %*s %*s %*s %*s %-*s  %s",
 		"Idx",
+		layout.target,
 		"Target",
+		layout.kind,
 		"Type",
+		layout.state,
 		"State",
+		layout.latency,
 		"Latency",
-		"Consec",
+		layout.fail,
+		"Fail",
+		layout.age,
 		"Age",
-		lossWidth,
-		lossHeader,
-		ratioWidth,
-		ratioHeader,
+		layout.loss,
+		"Loss%",
+		layout.ratio,
+		"OK/Fail",
+		layout.ip,
 		"Last IP",
 		"Error",
 	)
@@ -693,60 +902,175 @@ func (renderer *Renderer) buildTargetTable(statsList []TargetStats, width int, c
 	}
 
 	for index, stats := range statsList {
+		selector := " "
+		if index == selectedTargetIndex {
+			selector = ">"
+		}
+		indexText := renderer.style(
+			fmt.Sprintf("%s%2d", selector, index+1),
+			ternaryString(index == selectedTargetIndex, "yellow", ""),
+			index == selectedTargetIndex,
+			stats.Disabled && index != selectedTargetIndex,
+		)
+		if stats.Disabled {
+			rest := fmt.Sprintf(
+				" %-*s %-*s %-*s %*s %*s %*s %*s %*s %-*s  %s",
+				layout.target,
+				shorten(stats.Target, layout.target),
+				layout.kind,
+				renderer.targetTypeLabel(stats.TargetType, layout.kind),
+				layout.state,
+				"disabled",
+				layout.latency,
+				"-",
+				layout.fail,
+				"-",
+				layout.age,
+				"-",
+				layout.loss,
+				"-",
+				layout.ratio,
+				"-",
+				layout.ip,
+				"-",
+				"-",
+			)
+			lines = append(lines, indexText+renderer.style(rest, "white", false, true))
+			continue
+		}
 		stateLabel := renderer.targetStateLabel(stats, config)
-		statePlain := fmt.Sprintf("%-10s", stateLabel)
-		stateText := renderer.style(statePlain, renderer.stateColor(stats, config), stats.LastState == "down" && !stats.Checking, false)
+		statePlain := fmt.Sprintf("%-*s", layout.state, shorten(stateLabel, layout.state))
+		stateText := renderer.style(statePlain, renderer.stateColor(stats, config), stats.LastState == "down", false)
 		latencyColor := renderer.latencyColor(stats.LastLatencyMS, config)
-		latencyText := renderer.style(fmt.Sprintf("%9s", formatLatency(stats.LastLatencyMS)), latencyColor, latencyColor == "red", false)
+		latencyText := renderer.style(fmt.Sprintf("%*s", layout.latency, formatLatency(stats.LastLatencyMS)), latencyColor, latencyColor == "red", false)
 		consecutiveText := renderer.style(
-			fmt.Sprintf("%6d", stats.ConsecutiveFailures),
+			fmt.Sprintf("%*d", layout.fail, stats.ConsecutiveFailures),
 			ternaryString(stats.ConsecutiveFailures > 0, "red", "green"),
 			stats.ConsecutiveFailures > 0,
 			false,
 		)
 		lossText := renderer.style(
-			fmt.Sprintf("%*.1f%%", lossWidth-1, stats.WindowSummary.LossPercentage()),
+			fmt.Sprintf("%*.1f%%", layout.loss-1, stats.WindowSummary.LossPercentage()),
 			renderer.lossColor(stats.WindowSummary.LossPercentage()),
 			false,
 			false,
 		)
 		okFailText := renderer.style(
-			fmt.Sprintf("%*s", ratioWidth, abbreviateRatio(stats.WindowSummary.Successes, stats.WindowSummary.Failures)),
+			fmt.Sprintf("%*s", layout.ratio, abbreviateRatio(stats.WindowSummary.Successes, stats.WindowSummary.Failures)),
 			ternaryString(stats.WindowSummary.Failures > 0, "red", "green"),
 			false,
 			false,
 		)
-		ageText := renderer.style(fmt.Sprintf("%7s", renderer.targetAge(stats)), renderer.targetAgeColor(stats, config), false, false)
-		errorText := "-"
-		if stats.LastErrorCategory != "" && stats.LastErrorCategory != "ok" {
-			errorText = stats.LastErrorCategory
-			if stats.LastErrorMessage != "" {
-				errorText = stats.LastErrorCategory + ": " + stats.LastErrorMessage
-			}
-		}
-		fixedWidth := 3 + 1 + 24 + 1 + 8 + 1 + 10 + 1 + 9 + 1 + 6 + 1 + 7 + 1 + lossWidth + 1 + ratioWidth + 1 + 18 + 2
-		errorText = shorten(errorText, maxInt(10, width-fixedWidth))
+		ageText := renderer.style(fmt.Sprintf("%*s", layout.age, renderer.targetAge(stats)), renderer.targetAgeColor(stats, config), false, false)
+		errorText := defaultString(renderer.targetErrorText(stats), "-")
+		errorText = shorten(errorText, layout.error)
 		if errorText != "-" {
 			errorText = renderer.style(errorText, "red", true, false)
 		}
 
 		line := fmt.Sprintf(
-			"%3d %-24s %-8s %s %s %s %s %s %s %-18s  %s",
-			index+1,
-			shorten(stats.Target, 24),
-			stats.TargetType,
+			"%s %-*s %-*s %s %s %s %s %s %s %-*s  %s",
+			indexText,
+			layout.target,
+			shorten(stats.Target, layout.target),
+			layout.kind,
+			renderer.targetTypeLabel(stats.TargetType, layout.kind),
 			stateText,
 			latencyText,
 			consecutiveText,
 			ageText,
 			lossText,
 			okFailText,
-			shorten(defaultString(stats.LastResolvedIP, "-"), 18),
+			layout.ip,
+			shorten(defaultString(stats.LastResolvedIP, "-"), layout.ip),
 			errorText,
 		)
 		lines = append(lines, line)
 	}
 	return lines
+}
+
+func (renderer *Renderer) targetTableLayout(statsList []TargetStats, width int, config AppConfig) targetTableLayout {
+	layout := targetTableLayout{
+		target:  16,
+		kind:    4,
+		state:   len("State"),
+		latency: len("Latency"),
+		fail:    len("Fail"),
+		age:     len("Age"),
+		loss:    len("Loss%"),
+		ratio:   len("OK/Fail"),
+		ip:      len("Last IP"),
+		error:   len("Error"),
+	}
+	longestTarget := len("Target")
+	longestIP := len("Last IP")
+	for _, stats := range statsList {
+		longestTarget = maxInt(longestTarget, len(stats.Target))
+		longestIP = maxInt(longestIP, len(defaultString(stats.LastResolvedIP, "-")))
+		layout.state = maxInt(layout.state, len(renderer.targetStateLabel(stats, config)))
+		layout.latency = maxInt(layout.latency, len(formatLatency(stats.LastLatencyMS)))
+		layout.fail = maxInt(layout.fail, len(fmt.Sprintf("%d", stats.ConsecutiveFailures)))
+		layout.age = maxInt(layout.age, len(renderer.targetAge(stats)))
+		layout.loss = maxInt(layout.loss, len(fmt.Sprintf("%.1f%%", stats.WindowSummary.LossPercentage())))
+		layout.ratio = maxInt(layout.ratio, len(abbreviateRatio(stats.WindowSummary.Successes, stats.WindowSummary.Failures)))
+	}
+
+	layout.target = minInt(maxInt(longestTarget, 16), 24)
+	layout.state = minInt(layout.state, 9)
+	layout.latency = minInt(maxInt(layout.latency, 7), 8)
+	layout.fail = minInt(maxInt(layout.fail, 4), 5)
+	layout.age = minInt(maxInt(layout.age, 4), 6)
+	layout.loss = minInt(maxInt(layout.loss, 5), 6)
+	layout.ratio = minInt(maxInt(layout.ratio, 7), 10)
+	layout.ip = minInt(maxInt(longestIP, len("Last IP")), 15)
+
+	const minimumErrorWidth = 16
+	layout.error = width - layout.fixedWidthBeforeError()
+	if layout.error >= minimumErrorWidth {
+		return layout
+	}
+
+	needed := minimumErrorWidth - layout.error
+	needed = layout.shrinkColumn(&layout.target, 12, needed)
+	needed = layout.shrinkColumn(&layout.ip, 7, needed)
+	needed = layout.shrinkColumn(&layout.ratio, len("OK/Fail"), needed)
+	needed = layout.shrinkColumn(&layout.state, len("State"), needed)
+	needed = layout.shrinkColumn(&layout.age, len("Age"), needed)
+	layout.error = maxInt(1, width-layout.fixedWidthBeforeError())
+	return layout
+}
+
+func (layout targetTableLayout) fixedWidthBeforeError() int {
+	return 3 +
+		1 + layout.target +
+		1 + layout.kind +
+		1 + layout.state +
+		1 + layout.latency +
+		1 + layout.fail +
+		1 + layout.age +
+		1 + layout.loss +
+		1 + layout.ratio +
+		1 + layout.ip +
+		2
+}
+
+func (layout targetTableLayout) shrinkColumn(column *int, minimum int, needed int) int {
+	if needed <= 0 {
+		return 0
+	}
+	available := maxInt(0, *column-minimum)
+	shrinkBy := minInt(available, needed)
+	*column -= shrinkBy
+	return needed - shrinkBy
+}
+
+func (renderer *Renderer) targetTypeLabel(targetType string, width int) string {
+	label := targetType
+	if targetType == "hostname" && width <= 4 {
+		label = "host"
+	}
+	return shorten(label, width)
 }
 
 func (renderer *Renderer) buildEventPanel(events []EventEntry, width, start, end int, ansi bool) []string {
@@ -806,6 +1130,8 @@ func (renderer *Renderer) isInterestingEvent(event EventEntry) bool {
 		"UI refresh interval set to ",
 		"Around-failure window set to ",
 		"Stats window ",
+		"Enabled target ",
+		"Disabled target ",
 	}
 	for _, prefix := range notablePrefixes {
 		if strings.HasPrefix(event.Message, prefix) {
@@ -819,7 +1145,7 @@ func (renderer *Renderer) activeCycleText(status pingtop.CycleStatus) string {
 	if !status.Active {
 		return "idle"
 	}
-	return fmt.Sprintf("cycle %d %d/%d", status.CycleID, status.CompletedChecks, status.TotalChecks)
+	return fmt.Sprintf("checks %d/%d", status.CompletedChecks, status.TotalChecks)
 }
 
 func (renderer *Renderer) activeCycleColor(status pingtop.CycleStatus) string {
@@ -830,7 +1156,10 @@ func (renderer *Renderer) activeCycleColor(status pingtop.CycleStatus) string {
 }
 
 func (renderer *Renderer) targetStateLabel(stats TargetStats, config AppConfig) string {
-	if stats.Checking {
+	if stats.Disabled {
+		return "disabled"
+	}
+	if stats.Checking && stats.LastCheckedAt.IsZero() {
 		return "checking"
 	}
 	if renderer.targetIsStale(stats, config) {
@@ -839,8 +1168,24 @@ func (renderer *Renderer) targetStateLabel(stats TargetStats, config AppConfig) 
 	return strings.ToLower(defaultString(stats.LastResult, "pending"))
 }
 
+func (renderer *Renderer) targetErrorText(stats TargetStats) string {
+	if stats.LastErrorCategory == "" || stats.LastErrorCategory == "ok" {
+		return ""
+	}
+	if stats.LastErrorMessage == "" {
+		return stats.LastErrorCategory
+	}
+	return stats.LastErrorCategory + ": " + stats.LastErrorMessage
+}
+
 func (renderer *Renderer) stateColor(stats TargetStats, config AppConfig) string {
-	if stats.Checking || renderer.targetIsStale(stats, config) {
+	if stats.Disabled {
+		return "white"
+	}
+	if stats.Checking && stats.LastCheckedAt.IsZero() {
+		return "yellow"
+	}
+	if renderer.targetIsStale(stats, config) {
 		return "yellow"
 	}
 	if stats.LastState == "up" {
@@ -864,13 +1209,19 @@ func (renderer *Renderer) targetAge(stats TargetStats) string {
 }
 
 func (renderer *Renderer) targetAgeColor(stats TargetStats, config AppConfig) string {
-	if stats.Checking || renderer.targetIsStale(stats, config) {
+	if stats.Disabled {
+		return ""
+	}
+	if renderer.targetIsStale(stats, config) {
 		return "yellow"
 	}
 	return ""
 }
 
 func (renderer *Renderer) targetIsStale(stats TargetStats, config AppConfig) bool {
+	if stats.Disabled {
+		return false
+	}
 	if stats.Checking || stats.LastCheckedAt.IsZero() {
 		return false
 	}

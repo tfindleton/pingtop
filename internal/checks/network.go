@@ -247,12 +247,13 @@ func (coordinator *CheckCoordinator) ExecuteCycle(config AppConfig, cycleID int)
 }
 
 func (coordinator *CheckCoordinator) ExecuteCycleContext(ctx context.Context, config AppConfig, cycleID int, onProgress func(CheckResult)) []CheckResult {
-	if len(config.Targets) == 0 {
+	targets := config.EnabledTargets()
+	if len(targets) == 0 {
 		return nil
 	}
-	results := make([]CheckResult, len(config.Targets))
-	resultCh := make(chan cycleResult, len(config.Targets))
-	for index, target := range config.Targets {
+	results := make([]CheckResult, len(targets))
+	resultCh := make(chan cycleResult, len(targets))
+	for index, target := range targets {
 		go func(index int, target TargetSpec) {
 			result := coordinator.safeCheckTarget(ctx, target, config.PingTimeoutMS, cycleID, fmt.Sprintf("worker-%d", index+1))
 			select {
@@ -262,7 +263,7 @@ func (coordinator *CheckCoordinator) ExecuteCycleContext(ctx context.Context, co
 		}(index, target)
 	}
 
-	for completed := 0; completed < len(config.Targets); completed++ {
+	for completed := 0; completed < len(targets); completed++ {
 		select {
 		case item := <-resultCh:
 			results[item.index] = item.result
@@ -274,6 +275,10 @@ func (coordinator *CheckCoordinator) ExecuteCycleContext(ctx context.Context, co
 		}
 	}
 	return results
+}
+
+func (coordinator *CheckCoordinator) CheckTargetContext(ctx context.Context, target TargetSpec, timeoutMS, cycleID int, workerID string) CheckResult {
+	return coordinator.safeCheckTarget(ctx, target, timeoutMS, cycleID, workerID)
 }
 
 func (coordinator *CheckCoordinator) safeCheckTarget(ctx context.Context, target TargetSpec, timeoutMS, cycleID int, workerID string) (result CheckResult) {

@@ -378,8 +378,11 @@ type PingTopUI struct {
 	monitor           *BackgroundMonitor
 	renderer          *Renderer
 	helpVisible       bool
+	detailsVisible    bool
+	eventsVisible     bool
 	prompt            *PromptState
 	eventScrollOffset int
+	selectedTarget    int
 	running           bool
 	lastUpdateState   string
 	dirty             bool
@@ -393,7 +396,10 @@ type uiRenderState struct {
 	UpdateStatus      UpdateStatus
 	Paused            bool
 	HelpVisible       bool
+	DetailsVisible    bool
+	EventsVisible     bool
 	EventScrollOffset int
+	SelectedTarget    int
 	HasPrompt         bool
 	Prompt            PromptState
 	Width             int
@@ -409,17 +415,19 @@ func NewPingTopUI(
 	updateManager *UpdateManager,
 ) *PingTopUI {
 	ui := &PingTopUI{
-		runtimePaths:  runtimePaths,
-		configManager: configManager,
-		stateStore:    stateStore,
-		logger:        logger,
-		coordinator:   coordinator,
-		updateManager: updateManager,
-		monitor:       NewBackgroundMonitor(configManager, stateStore, logger, coordinator),
-		renderer:      termui.NewRenderer(),
-		helpVisible:   configManager.Snapshot().HelpVisible,
-		running:       true,
-		dirty:         true,
+		runtimePaths:   runtimePaths,
+		configManager:  configManager,
+		stateStore:     stateStore,
+		logger:         logger,
+		coordinator:    coordinator,
+		updateManager:  updateManager,
+		monitor:        NewBackgroundMonitor(configManager, stateStore, logger, coordinator),
+		renderer:       termui.NewRenderer(),
+		helpVisible:    configManager.Snapshot().HelpVisible,
+		detailsVisible: configManager.Snapshot().DetailsVisible,
+		eventsVisible:  configManager.Snapshot().EventsVisible,
+		running:        true,
+		dirty:          true,
 	}
 	if warning := configManager.LoadWarning(); warning != "" {
 		stateStore.AddEvent("warn", warning, time.Time{})
@@ -469,14 +477,17 @@ func (ui *PingTopUI) renderIfNeeded(config AppConfig) {
 	if !ui.dirty && ui.hasLastRender && renderState == ui.lastRender {
 		return
 	}
-	screen := ui.renderer.BuildScreen(
+	screen := ui.renderer.BuildScreenWithSelection(
 		snapshot,
 		config,
 		renderState.Paused,
 		renderState.HelpVisible,
+		renderState.DetailsVisible,
+		renderState.EventsVisible,
 		ui.prompt,
 		renderState.UpdateStatus,
 		renderState.EventScrollOffset,
+		renderState.SelectedTarget,
 	)
 	ui.renderer.Draw(screen)
 	ui.lastRender = renderState
@@ -492,19 +503,25 @@ func (ui *PingTopUI) buildRenderState(snapshot StateSnapshot, config AppConfig) 
 		UpdateStatus:   ui.updateManager.Snapshot(),
 		Paused:         ui.monitor.IsPaused(),
 		HelpVisible:    ui.helpVisible,
+		DetailsVisible: ui.detailsVisible,
+		EventsVisible:  ui.eventsVisible,
 		Width:          width,
 		Height:         height,
 	}
+	ui.normalizeSelectedTarget(config)
 	ui.eventScrollOffset, _ = ui.renderer.EventScrollState(
 		snapshot,
 		config,
 		state.Paused,
 		state.HelpVisible,
+		state.DetailsVisible,
+		state.EventsVisible,
 		ui.prompt,
 		state.UpdateStatus,
 		ui.eventScrollOffset,
 	)
 	state.EventScrollOffset = ui.eventScrollOffset
+	state.SelectedTarget = ui.selectedTarget
 	if ui.prompt != nil {
 		state.HasPrompt = true
 		state.Prompt = *ui.prompt
@@ -542,10 +559,10 @@ func (ui *PingTopUI) handleKey(key string) {
 
 	switch key {
 	case termui.KeyUp:
-		ui.scrollEvents(1)
+		ui.moveSelectedTarget(-1)
 		return
 	case termui.KeyDown:
-		ui.scrollEvents(-1)
+		ui.moveSelectedTarget(1)
 		return
 	case termui.KeyPageUp:
 		ui.pageEvents(1)
@@ -554,11 +571,22 @@ func (ui *PingTopUI) handleKey(key string) {
 		ui.pageEvents(-1)
 		return
 	}
+	if key == "D" {
+		ui.dirty = true
+		ui.prompt = &PromptState{Kind: "delete", Message: "enter target index or exact target to delete"}
+		return
+	}
 
 	switch strings.ToLower(key) {
 	case "q":
 		ui.dirty = true
 		ui.running = false
+	case "j":
+		ui.moveSelectedTarget(1)
+	case "k":
+		ui.moveSelectedTarget(-1)
+	case " ", "\r", "\n":
+		ui.toggleSelectedTarget()
 	case "p":
 		ui.dirty = true
 		paused := ui.monitor.TogglePause()
@@ -575,7 +603,7 @@ func (ui *PingTopUI) handleKey(key string) {
 		ui.prompt = &PromptState{Kind: "add", Message: "enter a hostname or IP to add"}
 	case "d":
 		ui.dirty = true
-		ui.prompt = &PromptState{Kind: "delete", Message: "enter target index or exact target to delete"}
+		ui.startDeleteSelectedPrompt()
 	case "w":
 		ui.dirty = true
 		ui.prompt = &PromptState{Kind: "window", Message: "duration or before,after (example 10s or 10s,20s)"}
@@ -602,6 +630,19 @@ func (ui *PingTopUI) handleKey(key string) {
 			config.HelpVisible = !ui.helpVisible
 		})
 		ui.helpVisible = config.HelpVisible
+	case "i":
+		ui.dirty = true
+		config := ui.configManager.Update(func(config *pingtop.AppConfig) {
+			config.DetailsVisible = !ui.detailsVisible
+		})
+		ui.detailsVisible = config.DetailsVisible
+	case "e":
+		ui.dirty = true
+		config := ui.configManager.Update(func(config *pingtop.AppConfig) {
+			config.EventsVisible = !ui.eventsVisible
+		})
+		ui.eventsVisible = config.EventsVisible
+		ui.normalizeEventScroll()
 	default:
 		switch key {
 		case "+", "=":
@@ -622,6 +663,10 @@ func (ui *PingTopUI) handleKey(key string) {
 
 func (ui *PingTopUI) handlePromptKey(key string) {
 	if ui.prompt == nil {
+		return
+	}
+	if ui.prompt.Kind == "confirm_delete" {
+		ui.handleDeleteConfirmationKey(key)
 		return
 	}
 	switch key {
@@ -656,6 +701,32 @@ func (ui *PingTopUI) handlePromptKey(key string) {
 	}
 }
 
+func (ui *PingTopUI) handleDeleteConfirmationKey(key string) {
+	if ui.prompt == nil {
+		return
+	}
+	switch strings.ToLower(key) {
+	case "y":
+		targetValue := ui.prompt.TargetValue
+		ui.prompt = nil
+		ui.dirty = true
+		ui.deleteTargetValue(targetValue, targetValue)
+	case "n", termui.KeyEscape:
+		ui.prompt = nil
+		ui.dirty = true
+		ui.stateStore.AddEvent("info", "Delete target canceled", time.Time{})
+	case "d":
+		ui.prompt = &PromptState{Kind: "delete", Message: "enter target index or exact target to delete"}
+		ui.dirty = true
+	case "\r", "\n":
+		ui.prompt = nil
+		ui.dirty = true
+		ui.stateStore.AddEvent("info", "Delete target canceled", time.Time{})
+	default:
+		return
+	}
+}
+
 func (ui *PingTopUI) scrollEvents(delta int) {
 	if delta == 0 {
 		return
@@ -685,10 +756,93 @@ func (ui *PingTopUI) eventScrollState() (int, int) {
 		config,
 		ui.monitor.IsPaused(),
 		ui.helpVisible,
+		ui.detailsVisible,
+		ui.eventsVisible,
 		ui.prompt,
 		ui.updateManager.Snapshot(),
 		ui.eventScrollOffset,
 	)
+}
+
+func (ui *PingTopUI) normalizeSelectedTarget(config AppConfig) {
+	if len(config.Targets) == 0 {
+		ui.selectedTarget = -1
+		return
+	}
+	if ui.selectedTarget < 0 {
+		ui.selectedTarget = 0
+		return
+	}
+	if ui.selectedTarget >= len(config.Targets) {
+		ui.selectedTarget = len(config.Targets) - 1
+	}
+}
+
+func (ui *PingTopUI) moveSelectedTarget(delta int) {
+	config := ui.configManager.Snapshot()
+	if len(config.Targets) == 0 {
+		ui.selectedTarget = -1
+		return
+	}
+	ui.normalizeSelectedTarget(config)
+	ui.selectedTarget += delta
+	if ui.selectedTarget < 0 {
+		ui.selectedTarget = 0
+	}
+	if ui.selectedTarget >= len(config.Targets) {
+		ui.selectedTarget = len(config.Targets) - 1
+	}
+	ui.dirty = true
+}
+
+func (ui *PingTopUI) toggleSelectedTarget() {
+	configSnapshot := ui.configManager.Snapshot()
+	if len(configSnapshot.Targets) == 0 {
+		ui.selectedTarget = -1
+		ui.dirty = true
+		ui.stateStore.AddEvent("warn", "No target selected", time.Time{})
+		return
+	}
+	ui.normalizeSelectedTarget(configSnapshot)
+	selected := ui.selectedTarget
+	targetValue := configSnapshot.Targets[selected].Value
+	disabled := false
+	config := ui.configManager.Update(func(config *pingtop.AppConfig) {
+		if selected < 0 || selected >= len(config.Targets) {
+			return
+		}
+		config.Targets[selected].Disabled = !config.Targets[selected].Disabled
+		disabled = config.Targets[selected].Disabled
+		targetValue = config.Targets[selected].Value
+	})
+	ui.stateStore.SyncTargets(config)
+	ui.monitor.ForceRefresh()
+	ui.dirty = true
+	if disabled {
+		ui.stateStore.AddEvent("info", "Disabled target "+targetValue, time.Time{})
+		return
+	}
+	ui.stateStore.AddEvent("info", "Enabled target "+targetValue, time.Time{})
+}
+
+func (ui *PingTopUI) startDeleteSelectedPrompt() {
+	config := ui.configManager.Snapshot()
+	if len(config.Targets) == 0 {
+		ui.prompt = &PromptState{Kind: "delete", Message: "enter target index or exact target to delete"}
+		return
+	}
+	ui.normalizeSelectedTarget(config)
+	if ui.selectedTarget < 0 || ui.selectedTarget >= len(config.Targets) {
+		ui.prompt = &PromptState{Kind: "delete", Message: "enter target index or exact target to delete"}
+		return
+	}
+	target := config.Targets[ui.selectedTarget]
+	ui.prompt = &PromptState{
+		Kind:        "confirm_delete",
+		Message:     fmt.Sprintf("delete selected target %s? y/N", target.Value),
+		TargetIndex: ui.selectedTarget,
+		TargetValue: target.Value,
+	}
 }
 
 func (ui *PingTopUI) cycleLoggingMode() {
@@ -766,6 +920,7 @@ func (ui *PingTopUI) submitAddTarget(raw string) {
 	config := ui.configManager.Update(func(config *pingtop.AppConfig) {
 		config.Targets = append(config.Targets, target)
 	})
+	ui.selectedTarget = len(config.Targets) - 1
 	ui.stateStore.SyncTargets(config)
 	ui.monitor.ForceRefresh()
 	ui.stateStore.AddEvent("info", "Added target "+target.Value, time.Time{})
@@ -793,6 +948,10 @@ func (ui *PingTopUI) submitDeleteTarget(raw string) {
 		return
 	}
 
+	ui.deleteTargetValue(targetToRemove, raw)
+}
+
+func (ui *PingTopUI) deleteTargetValue(targetToRemove string, raw string) {
 	removed := false
 	config := ui.configManager.Update(func(config *pingtop.AppConfig) {
 		kept := make([]TargetSpec, 0, len(config.Targets))
@@ -806,6 +965,7 @@ func (ui *PingTopUI) submitDeleteTarget(raw string) {
 		config.Targets = kept
 	})
 	ui.stateStore.SyncTargets(config)
+	ui.normalizeSelectedTarget(config)
 	if removed {
 		ui.monitor.ForceRefresh()
 		ui.stateStore.AddEvent("info", "Deleted target "+targetToRemove, time.Time{})

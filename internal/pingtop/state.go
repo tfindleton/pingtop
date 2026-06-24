@@ -74,6 +74,7 @@ type StateStore struct {
 	stats                  map[string]*TargetStats
 	targetWindows          map[string]*RollingWindowCounter
 	targetOrder            []string
+	lastResults            map[string]CheckResult
 	session                SessionTotals
 	sessionWindow          *RollingWindowCounter
 	statsWindowSeconds     int
@@ -94,6 +95,7 @@ func NewStateStore(config AppConfig) *StateStore {
 		stats:              make(map[string]*TargetStats),
 		targetWindows:      make(map[string]*RollingWindowCounter),
 		targetOrder:        make([]string, 0, len(config.Targets)),
+		lastResults:        make(map[string]CheckResult),
 		session:            NewSessionTotals(),
 		sessionWindow:      NewRollingWindowCounter(config.StatsWindowSeconds),
 		statsWindowSeconds: config.StatsWindowSeconds,
@@ -128,6 +130,7 @@ func (store *StateStore) syncTargetsLocked(config AppConfig) bool {
 
 	orderedStats := make(map[string]*TargetStats, len(config.Targets))
 	orderedWindows := make(map[string]*RollingWindowCounter, len(config.Targets))
+	orderedResults := make(map[string]CheckResult, len(config.Targets))
 	order := make([]string, 0, len(config.Targets))
 
 	for _, target := range config.Targets {
@@ -142,6 +145,10 @@ func (store *StateStore) syncTargetsLocked(config AppConfig) bool {
 		} else {
 			stats.TargetType = target.Kind
 		}
+		stats.Disabled = target.Disabled
+		if target.Disabled {
+			stats.Checking = false
+		}
 		orderedStats[target.Value] = stats
 		if windowReset {
 			orderedWindows[target.Value] = NewRollingWindowCounter(store.statsWindowSeconds)
@@ -150,11 +157,15 @@ func (store *StateStore) syncTargetsLocked(config AppConfig) bool {
 		} else {
 			orderedWindows[target.Value] = NewRollingWindowCounter(store.statsWindowSeconds)
 		}
+		if result, exists := store.lastResults[target.Value]; exists {
+			orderedResults[target.Value] = result
+		}
 		order = append(order, target.Value)
 	}
 
 	store.stats = orderedStats
 	store.targetWindows = orderedWindows
+	store.lastResults = orderedResults
 	store.targetOrder = order
 	return windowReset
 }
@@ -179,10 +190,13 @@ func (store *StateStore) BeginCycle(cycleID int, generation int64, config AppCon
 		CycleID:         cycleID,
 		Generation:      generation,
 		StartedAt:       timestamp,
-		TotalChecks:     len(config.Targets),
+		TotalChecks:     config.EnabledTargetCount(),
 		CompletedChecks: 0,
 	}
 	for _, target := range config.Targets {
+		if target.Disabled {
+			continue
+		}
 		if stats := store.stats[target.Value]; stats != nil {
 			stats.Checking = true
 		}
@@ -202,6 +216,58 @@ func (store *StateStore) NoteCycleProgress(cycleID int, generation int64, result
 	if stats := store.stats[result.Target]; stats != nil {
 		stats.Checking = false
 	}
+	store.revision++
+}
+
+func (store *StateStore) BeginTargetCheck(cycleID int, generation int64, config AppConfig, target TargetSpec, timestamp time.Time) {
+	if target.Disabled {
+		return
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	store.syncTargetsLocked(config)
+	if timestamp.IsZero() {
+		timestamp = time.Now()
+	}
+	if stats := store.stats[target.Value]; stats != nil && !stats.Disabled {
+		stats.Checking = true
+	}
+	store.recomputeActiveChecksLocked(cycleID, generation, timestamp, config)
+	store.revision++
+}
+
+func (store *StateStore) HandleTargetResult(result CheckResult, config AppConfig, cycleID int, generation int64) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	windowReset := store.syncTargetsLocked(config)
+	if config.LoggingMode != LoggingModeOff && windowReset && store.session.CyclesCompleted > 0 {
+		store.addEventLocked(
+			"info",
+			fmt.Sprintf("Stats window changed to %s; rolling counters reset", FormatCompactSpan(store.statsWindowSeconds)),
+			time.Time{},
+		)
+	}
+
+	stats := store.stats[result.Target]
+	if stats == nil || stats.Disabled {
+		store.recomputeActiveChecksLocked(cycleID, generation, result.Timestamp, config)
+		store.revision++
+		return
+	}
+
+	previousState, previousError := stats.Apply(result)
+	store.observeResultLocked(result, config, stats, previousState, previousError)
+	store.lastResults[result.Target] = result
+	if store.completedLogicalCycleLocked(config) {
+		store.session.CyclesCompleted++
+		store.lastCycleID = cycleID
+		store.lastCycleCompletedAt = store.latestResultTimeLocked(config)
+		store.updateDiagnosisFromLatestLocked(config)
+	}
+	store.recomputeActiveChecksLocked(cycleID, generation, result.Timestamp, config)
 	store.revision++
 }
 
@@ -285,44 +351,8 @@ func (store *StateStore) HandleCycle(results []CheckResult, config AppConfig, cy
 		}
 
 		previousState, previousError := stats.Apply(result)
-		store.sessionWindow.Observe(result.Timestamp, result)
-		window := store.targetWindows[result.Target]
-		if window == nil {
-			window = NewRollingWindowCounter(store.statsWindowSeconds)
-			store.targetWindows[result.Target] = window
-		}
-		window.Observe(result.Timestamp, result)
-
-		store.session.TotalChecks++
-		if result.IsFailure() {
-			store.session.Failures++
-		} else {
-			store.session.Successes++
-		}
-		if result.DNSSuccess != nil && !*result.DNSSuccess {
-			store.session.DNSFailures++
-		} else if !result.PingSuccess {
-			store.session.PingFailures++
-		}
-
-		if result.PingSuccess && stats.RecoveryPending && stats.ConsecutiveSuccesses >= config.RecoveryConfirmCycles {
-			if config.LoggingMode != LoggingModeOff {
-				store.addEventLocked(
-					"info",
-					fmt.Sprintf("%s recovered (%s)", result.Target, FormatLatency(result.LatencyMS)),
-					result.Timestamp,
-				)
-			}
-			stats.RecoveryPending = false
-		} else if result.IsFailure() {
-			if shouldReportFailureEvent(previousState, previousError, stats, result, config) {
-				store.addEventLocked(
-					"warn",
-					fmt.Sprintf("%s %s: %s", result.Target, result.StatusText(), HumanErrorMessage(result)),
-					result.Timestamp,
-				)
-			}
-		}
+		store.observeResultLocked(result, config, stats, previousState, previousError)
+		store.lastResults[result.Target] = result
 	}
 
 	assessment := diagnoseCycle(results, config)
@@ -331,6 +361,47 @@ func (store *StateStore) HandleCycle(results []CheckResult, config AppConfig, cy
 	}
 	store.clearActiveCycleLocked()
 	store.revision++
+}
+
+func (store *StateStore) observeResultLocked(result CheckResult, config AppConfig, stats *TargetStats, previousState, previousError string) {
+	store.sessionWindow.Observe(result.Timestamp, result)
+	window := store.targetWindows[result.Target]
+	if window == nil {
+		window = NewRollingWindowCounter(store.statsWindowSeconds)
+		store.targetWindows[result.Target] = window
+	}
+	window.Observe(result.Timestamp, result)
+
+	store.session.TotalChecks++
+	if result.IsFailure() {
+		store.session.Failures++
+	} else {
+		store.session.Successes++
+	}
+	if result.DNSSuccess != nil && !*result.DNSSuccess {
+		store.session.DNSFailures++
+	} else if !result.PingSuccess {
+		store.session.PingFailures++
+	}
+
+	if result.PingSuccess && stats.RecoveryPending && stats.ConsecutiveSuccesses >= config.RecoveryConfirmCycles {
+		if config.LoggingMode != LoggingModeOff {
+			store.addEventLocked(
+				"info",
+				fmt.Sprintf("%s recovered (%s)", result.Target, FormatLatency(result.LatencyMS)),
+				result.Timestamp,
+			)
+		}
+		stats.RecoveryPending = false
+	} else if result.IsFailure() {
+		if shouldReportFailureEvent(previousState, previousError, stats, result, config) {
+			store.addEventLocked(
+				"warn",
+				fmt.Sprintf("%s %s: %s", result.Target, result.StatusText(), HumanErrorMessage(result)),
+				result.Timestamp,
+			)
+		}
+	}
 }
 
 func (store *StateStore) ResetCounters() {
@@ -385,6 +456,112 @@ func (store *StateStore) Snapshot() StateSnapshot {
 		LastCycleCompletedAt: store.lastCycleCompletedAt,
 		LastCycleID:          store.lastCycleID,
 		ActiveCycle:          store.activeCycle,
+	}
+}
+
+func (store *StateStore) recomputeActiveChecksLocked(cycleID int, generation int64, timestamp time.Time, config AppConfig) {
+	totalChecks := 0
+	checking := 0
+	for _, target := range config.Targets {
+		if target.Disabled {
+			continue
+		}
+		totalChecks++
+		if stats := store.stats[target.Value]; stats != nil && stats.Checking {
+			checking++
+		}
+	}
+	if checking == 0 {
+		store.activeCycle = CycleStatus{}
+		return
+	}
+	startedAt := timestamp
+	if store.activeCycle.Active && !store.activeCycle.StartedAt.IsZero() {
+		startedAt = store.activeCycle.StartedAt
+	}
+	store.activeCycle = CycleStatus{
+		Active:          true,
+		CycleID:         cycleID,
+		Generation:      generation,
+		StartedAt:       startedAt,
+		TotalChecks:     totalChecks,
+		CompletedChecks: totalChecks - checking,
+	}
+}
+
+func (store *StateStore) completedLogicalCycleLocked(config AppConfig) bool {
+	if config.EnabledTargetCount() == 0 {
+		return true
+	}
+	if store.lastCycleCompletedAt.IsZero() {
+		for _, target := range config.Targets {
+			if target.Disabled {
+				continue
+			}
+			if _, exists := store.lastResults[target.Value]; !exists {
+				return false
+			}
+		}
+		return true
+	}
+	for _, target := range config.Targets {
+		if target.Disabled {
+			continue
+		}
+		result, exists := store.lastResults[target.Value]
+		if !exists || !result.Timestamp.After(store.lastCycleCompletedAt) {
+			return false
+		}
+	}
+	return true
+}
+
+func (store *StateStore) latestResultTimeLocked(config AppConfig) time.Time {
+	var latest time.Time
+	for _, target := range config.Targets {
+		if target.Disabled {
+			continue
+		}
+		result, exists := store.lastResults[target.Value]
+		if !exists {
+			continue
+		}
+		if latest.IsZero() || result.Timestamp.After(latest) {
+			latest = result.Timestamp
+		}
+	}
+	if latest.IsZero() {
+		return time.Now()
+	}
+	return latest
+}
+
+func (store *StateStore) latestResultsLocked(config AppConfig) ([]CheckResult, bool) {
+	if config.EnabledTargetCount() == 0 {
+		return nil, true
+	}
+	results := make([]CheckResult, 0, config.EnabledTargetCount())
+	for _, target := range config.Targets {
+		if target.Disabled {
+			continue
+		}
+		result, exists := store.lastResults[target.Value]
+		if !exists {
+			return results, false
+		}
+		results = append(results, result)
+	}
+	return results, true
+}
+
+func (store *StateStore) updateDiagnosisFromLatestLocked(config AppConfig) {
+	results, complete := store.latestResultsLocked(config)
+	if !complete {
+		return
+	}
+	assessment := diagnoseCycle(results, config)
+	if store.updateDiagnosisLocked(assessment, config) && config.LoggingMode != LoggingModeOff {
+		store.addEventLocked("info", "Diagnosis changed: "+store.diagnosis, store.lastCycleCompletedAt)
 	}
 }
 

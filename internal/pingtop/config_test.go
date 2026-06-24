@@ -40,6 +40,8 @@ func TestConfigNormalizesAndDeduplicatesTargets(t *testing.T) {
 		"ping_timeout_ms":               999999,
 		"ui_refresh_interval_seconds":   10.0,
 		"help_visible":                  false,
+		"details_visible":               true,
+		"events_visible":                false,
 		"stats_window_seconds":          5,
 		"diagnosis_confirm_cycles":      0,
 		"recovery_confirm_cycles":       99,
@@ -65,6 +67,12 @@ func TestConfigNormalizesAndDeduplicatesTargets(t *testing.T) {
 	}
 	if config.HelpVisible {
 		t.Fatal("expected help visibility override to be preserved")
+	}
+	if !config.DetailsVisible {
+		t.Fatal("expected details visibility override to be preserved")
+	}
+	if config.EventsVisible {
+		t.Fatal("expected events visibility override to be preserved")
 	}
 	if config.PingTimeoutMS != 30000 {
 		t.Fatalf("unexpected ping timeout: %d", config.PingTimeoutMS)
@@ -98,6 +106,30 @@ func TestConfigNormalizesAndDeduplicatesTargets(t *testing.T) {
 	}
 	if len(config.Targets) != 2 || config.Targets[0].Value != "8.8.8.8" || config.Targets[1].Value != "google.com" {
 		t.Fatalf("unexpected targets: %#v", config.Targets)
+	}
+}
+
+func TestConfigParsesDisabledTargets(t *testing.T) {
+	config := configFromMap(map[string]any{
+		"targets": []any{
+			map[string]any{"value": "1.1.1.1", "type": "ip", "disabled": true},
+			map[string]any{"value": "example.com", "type": "hostname", "enabled": false},
+			"8.8.8.8",
+		},
+	})
+	config.Normalize()
+
+	if len(config.Targets) != 3 {
+		t.Fatalf("unexpected targets: %#v", config.Targets)
+	}
+	if !config.Targets[0].Disabled || !config.Targets[1].Disabled {
+		t.Fatalf("expected first two targets to be disabled: %#v", config.Targets)
+	}
+	if config.Targets[2].Disabled {
+		t.Fatalf("expected string target to remain enabled: %#v", config.Targets[2])
+	}
+	if enabled := config.EnabledTargets(); len(enabled) != 1 || enabled[0].Value != "8.8.8.8" {
+		t.Fatalf("unexpected enabled targets: %#v", enabled)
 	}
 }
 
@@ -182,6 +214,12 @@ func TestConfigFromMapDefaultsHelpVisibleForOlderConfigs(t *testing.T) {
 	})
 	if !config.HelpVisible {
 		t.Fatal("expected help to default to visible when field is missing")
+	}
+	if config.DetailsVisible {
+		t.Fatal("expected details to default to hidden when field is missing")
+	}
+	if !config.EventsVisible {
+		t.Fatal("expected events to default to visible when field is missing")
 	}
 }
 

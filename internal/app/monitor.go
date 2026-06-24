@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -109,70 +110,113 @@ func (monitor *BackgroundMonitor) CurrentCycleID() int {
 
 func (monitor *BackgroundMonitor) run() {
 	defer close(monitor.doneCh)
-	nextRun := time.Now()
+	workersStarted := false
 	for {
 		select {
 		case <-monitor.stopCh:
+			monitor.cancelActiveCycle()
 			return
 		default:
 		}
 
 		if monitor.IsPaused() {
-			nextRun = time.Now()
-			if monitor.waitForSignal(100*time.Millisecond) == monitorSignalStop {
-				return
+			if workersStarted {
+				monitor.cancelActiveCycle()
+				monitor.stateStore.ClearActiveCycle()
+				workersStarted = false
 			}
-			continue
-		}
-
-		now := time.Now()
-		if now.Before(nextRun) {
-			switch monitor.waitForSignal(nextRun.Sub(now)) {
-			case monitorSignalStop:
+			if monitor.waitForSignal(100*time.Millisecond) == monitorSignalStop {
+				monitor.cancelActiveCycle()
 				return
-			case monitorSignalWake:
-				nextRun = time.Now()
 			}
 			continue
 		}
 
 		config := monitor.configManager.Snapshot()
-		cycleID := int(atomic.AddInt32(&monitor.cycleID, 1))
 		generation := atomic.LoadInt64(&monitor.generation)
-		ctx, cancel := monitor.newCycleContext()
-		monitor.stateStore.BeginCycle(cycleID, generation, config, time.Now())
-		results := monitor.coordinator.ExecuteCycleContext(ctx, config, cycleID, func(result CheckResult) {
-			monitor.stateStore.NoteCycleProgress(cycleID, generation, result)
-		})
-		cycleCanceled := ctx.Err() != nil
-		monitor.clearCycleContext(cancel)
-		if cycleCanceled || generation != atomic.LoadInt64(&monitor.generation) {
-			monitor.stateStore.FinishCycle(cycleID, generation)
-			nextRun = time.Now()
+		monitor.startTargetWorkers(config, generation)
+		workersStarted = true
+
+		switch monitor.waitForSignal(24 * time.Hour) {
+		case monitorSignalStop:
+			monitor.cancelActiveCycle()
+			return
+		case monitorSignalWake:
 			continue
 		}
-		monitor.stampSequences(results)
-		monitor.stateStore.HandleCycle(results, config, cycleID)
-		monitor.logger.LogResults(results, config)
-		nextRun = time.Now().Add(time.Duration(config.CheckIntervalSeconds * float64(time.Second)))
 	}
 }
 
-func (monitor *BackgroundMonitor) newCycleContext() (context.Context, context.CancelFunc) {
+func (monitor *BackgroundMonitor) startTargetWorkers(config AppConfig, generation int64) {
 	ctx, cancel := context.WithCancel(context.Background())
 	monitor.cycleMu.Lock()
+	previousCancel := monitor.cancelCycle
 	monitor.cancelCycle = cancel
 	monitor.cycleMu.Unlock()
-	return ctx, cancel
+	if previousCancel != nil {
+		previousCancel()
+	}
+
+	monitor.stateStore.SyncTargets(config)
+	targets := config.EnabledTargets()
+	if len(targets) == 0 {
+		cycleID := int(atomic.AddInt32(&monitor.cycleID, 1))
+		monitor.stateStore.HandleCycle(nil, config, cycleID)
+		return
+	}
+
+	for index, target := range targets {
+		go monitor.runTargetWorker(ctx, config, target, generation, index+1, fmt.Sprintf("target-%d", index+1))
+	}
 }
 
-func (monitor *BackgroundMonitor) clearCycleContext(cancel context.CancelFunc) {
-	monitor.cycleMu.Lock()
-	if monitor.cancelCycle != nil {
-		monitor.cancelCycle = nil
+func (monitor *BackgroundMonitor) runTargetWorker(
+	ctx context.Context,
+	config AppConfig,
+	target TargetSpec,
+	generation int64,
+	index int,
+	workerID string,
+) {
+	interval := time.Duration(config.CheckIntervalSeconds * float64(time.Second))
+	if interval <= 0 {
+		interval = time.Second
 	}
-	monitor.cycleMu.Unlock()
-	cancel()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-monitor.stopCh:
+			return
+		default:
+		}
+
+		cycleID := int(atomic.AddInt32(&monitor.cycleID, 1))
+		checkWorkerID := workerID
+		if checkWorkerID == "" {
+			checkWorkerID = fmt.Sprintf("target-%d", index)
+		}
+		monitor.stateStore.BeginTargetCheck(cycleID, generation, config, target, time.Now())
+		result := monitor.coordinator.CheckTargetContext(ctx, target, config.PingTimeoutMS, cycleID, checkWorkerID)
+		if ctx.Err() != nil || result.ErrorCategory == "canceled" {
+			monitor.stateStore.FinishCycle(cycleID, generation)
+			return
+		}
+		result.Sequence = atomic.AddInt64(&monitor.sequence, 1)
+		monitor.stateStore.HandleTargetResult(result, config, cycleID, generation)
+		monitor.logger.LogResults([]CheckResult{result}, config)
+
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-monitor.stopCh:
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
 }
 
 func (monitor *BackgroundMonitor) cancelActiveCycle() {

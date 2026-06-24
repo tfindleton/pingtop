@@ -8,8 +8,9 @@ import (
 )
 
 type TargetSpec struct {
-	Value string `json:"value"`
-	Kind  string `json:"type"`
+	Value    string `json:"value"`
+	Kind     string `json:"type"`
+	Disabled bool   `json:"disabled,omitempty"`
 }
 
 func InferTarget(value string) (TargetSpec, error) {
@@ -142,6 +143,7 @@ type RollingWindowBucket struct {
 type TargetStats struct {
 	Target               string
 	TargetType           string
+	Disabled             bool
 	Checking             bool
 	TotalChecks          int
 	SuccessCount         int
@@ -273,7 +275,9 @@ type CycleStatus struct {
 }
 
 type PromptState struct {
-	Kind    string
-	Message string
-	Buffer  string
+	Kind        string
+	Message     string
+	Buffer      string
+	TargetIndex int
+	TargetValue string
 }

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"errors"
 	"io"
 	"os"
@@ -203,6 +204,50 @@ func TestBackgroundMonitorWakeRunsBeforeLongInterval(t *testing.T) {
 	waitForCycles(t, stateStore, 2)
 }
 
+func TestBackgroundMonitorChecksFastTargetsWithoutWaitingForSlowTargets(t *testing.T) {
+	tempDir := t.TempDir()
+	configManager := pingtop.NewConfigManager(filepath.Join(tempDir, "pingtop.json"))
+	config := configManager.Update(func(config *AppConfig) {
+		config.Targets = []TargetSpec{
+			{Value: "fast.example", Kind: "hostname"},
+			{Value: "slow.example", Kind: "hostname"},
+		}
+		config.CheckIntervalSeconds = pingtop.CheckIntervalMinSeconds
+		config.PingTimeoutMS = 3000
+		config.LoggingMode = pingtop.LoggingModeOff
+	})
+	stateStore := pingtop.NewStateStore(config)
+	logger := pingtop.NewDisabledCSVLogger()
+	resolver := checks.NewDNSResolver(func(ctx context.Context, hostname string) (bool, string, string) {
+		if hostname == "slow.example" {
+			<-ctx.Done()
+			return false, "", ctx.Err().Error()
+		}
+		return false, "", "fast failure"
+	})
+	coordinator := checks.NewCheckCoordinator(checks.NewPingRunner(), resolver)
+	defer coordinator.Close()
+
+	monitor := NewBackgroundMonitor(configManager, stateStore, logger, coordinator)
+	monitor.Start()
+	defer monitor.Stop()
+
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		snapshot := stateStore.Snapshot()
+		if len(snapshot.TargetStats) == 2 &&
+			snapshot.TargetStats[0].TotalChecks >= 2 &&
+			snapshot.TargetStats[1].TotalChecks == 0 &&
+			snapshot.TargetStats[1].Checking {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	snapshot := stateStore.Snapshot()
+	t.Fatalf("expected fast target to check repeatedly before slow target completed, got %#v", snapshot.TargetStats)
+}
+
 func TestAdjustCheckIntervalWakesMonitor(t *testing.T) {
 	tempDir := t.TempDir()
 	services, err := buildServices(pingtop.RuntimePaths{
@@ -257,6 +302,139 @@ func TestRefreshKeysDecreaseAndIncreaseRefreshInterval(t *testing.T) {
 	ui.handleKey(">")
 	if got := services.configManager.Snapshot().UIRefreshIntervalSeconds; got != 1.0 {
 		t.Fatalf("expected > to increase refresh interval to 1.00s, got %.2f", got)
+	}
+}
+
+func TestTargetSelectionAndToggleDisablesSelectedTarget(t *testing.T) {
+	tempDir := t.TempDir()
+	services, err := buildServices(pingtop.RuntimePaths{
+		ConfigPath: filepath.Join(tempDir, "pingtop.json"),
+		LogPath:    filepath.Join(tempDir, "pingtop_log.csv"),
+	}, cliArgs{})
+	if err != nil {
+		t.Fatalf("unexpected buildServices error: %v", err)
+	}
+	defer services.coordinator.Close()
+
+	ui := NewPingTopUI(
+		services.runtimePaths,
+		services.configManager,
+		services.stateStore,
+		services.logger,
+		services.coordinator,
+		services.updateManager,
+	)
+
+	ui.handleKey(termui.KeyDown)
+	ui.handleKey(" ")
+	config := services.configManager.Snapshot()
+	if ui.selectedTarget != 1 {
+		t.Fatalf("expected second target to be selected, got %d", ui.selectedTarget)
+	}
+	if !config.Targets[1].Disabled {
+		t.Fatalf("expected selected target to be disabled: %#v", config.Targets[1])
+	}
+	if !services.stateStore.Snapshot().TargetStats[1].Disabled {
+		t.Fatal("expected state row to show disabled target")
+	}
+	if message := latestEventMessage(services.stateStore); !strings.Contains(message, "Disabled target "+config.Targets[1].Value) {
+		t.Fatalf("expected disabled event, got %q", message)
+	}
+
+	ui.handleKey("\n")
+	config = services.configManager.Snapshot()
+	if config.Targets[1].Disabled {
+		t.Fatalf("expected selected target to be enabled: %#v", config.Targets[1])
+	}
+}
+
+func TestDeleteKeyConfirmsSelectedTargetBeforeDeleting(t *testing.T) {
+	tempDir := t.TempDir()
+	services, err := buildServices(pingtop.RuntimePaths{
+		ConfigPath: filepath.Join(tempDir, "pingtop.json"),
+		LogPath:    filepath.Join(tempDir, "pingtop_log.csv"),
+	}, cliArgs{})
+	if err != nil {
+		t.Fatalf("unexpected buildServices error: %v", err)
+	}
+	defer services.coordinator.Close()
+
+	ui := NewPingTopUI(
+		services.runtimePaths,
+		services.configManager,
+		services.stateStore,
+		services.logger,
+		services.coordinator,
+		services.updateManager,
+	)
+	ui.handleKey(termui.KeyDown)
+	target := services.configManager.Snapshot().Targets[1].Value
+
+	ui.handleKey("d")
+	if ui.prompt == nil || ui.prompt.Kind != "confirm_delete" || ui.prompt.TargetValue != target {
+		t.Fatalf("expected selected delete confirmation for %q, got %#v", target, ui.prompt)
+	}
+	ui.handlePromptKey("D")
+	if ui.prompt == nil || ui.prompt.Kind != "delete" {
+		t.Fatalf("expected D from confirmation to switch to manual delete, got %#v", ui.prompt)
+	}
+	ui.prompt = nil
+
+	ui.handleKey("d")
+	if ui.prompt == nil || ui.prompt.Kind != "confirm_delete" || ui.prompt.TargetValue != target {
+		t.Fatalf("expected selected delete confirmation for %q, got %#v", target, ui.prompt)
+	}
+	ui.handlePromptKey("n")
+	if len(services.configManager.Snapshot().Targets) != 5 {
+		t.Fatal("expected canceling delete confirmation to keep targets")
+	}
+
+	ui.handleKey("d")
+	ui.handlePromptKey("y")
+	config := services.configManager.Snapshot()
+	if len(config.Targets) != 4 {
+		t.Fatalf("expected confirmed delete to remove one target, got %d", len(config.Targets))
+	}
+	for _, candidate := range config.Targets {
+		if candidate.Value == target {
+			t.Fatalf("expected target %q to be deleted: %#v", target, config.Targets)
+		}
+	}
+}
+
+func TestUppercaseDDeletesByManualPrompt(t *testing.T) {
+	tempDir := t.TempDir()
+	services, err := buildServices(pingtop.RuntimePaths{
+		ConfigPath: filepath.Join(tempDir, "pingtop.json"),
+		LogPath:    filepath.Join(tempDir, "pingtop_log.csv"),
+	}, cliArgs{})
+	if err != nil {
+		t.Fatalf("unexpected buildServices error: %v", err)
+	}
+	defer services.coordinator.Close()
+
+	ui := NewPingTopUI(
+		services.runtimePaths,
+		services.configManager,
+		services.stateStore,
+		services.logger,
+		services.coordinator,
+		services.updateManager,
+	)
+	target := services.configManager.Snapshot().Targets[0].Value
+
+	ui.handleKey("D")
+	if ui.prompt == nil || ui.prompt.Kind != "delete" {
+		t.Fatalf("expected manual delete prompt, got %#v", ui.prompt)
+	}
+	ui.handlePromptKey("1")
+	ui.handlePromptKey("\n")
+
+	config := services.configManager.Snapshot()
+	for _, candidate := range config.Targets {
+		if candidate.Value == target {
+			t.Fatalf("expected manual delete to remove %q: %#v", target, config.Targets)
+		}
 	}
 }
 
@@ -525,6 +703,98 @@ func TestHandleKeyHTogglesAndPersistsHelpVisibility(t *testing.T) {
 	)
 	if reopened.helpVisible {
 		t.Fatal("expected reopened UI to use saved hidden help state")
+	}
+}
+
+func TestHandleKeyITogglesAndPersistsDetailsVisibility(t *testing.T) {
+	tempDir := t.TempDir()
+	services, err := buildServices(pingtop.RuntimePaths{
+		ConfigPath: filepath.Join(tempDir, "pingtop.json"),
+		LogPath:    filepath.Join(tempDir, "pingtop_log.csv"),
+	}, cliArgs{})
+	if err != nil {
+		t.Fatalf("unexpected buildServices error: %v", err)
+	}
+	defer services.coordinator.Close()
+
+	ui := NewPingTopUI(
+		services.runtimePaths,
+		services.configManager,
+		services.stateStore,
+		services.logger,
+		services.coordinator,
+		services.updateManager,
+	)
+
+	if ui.detailsVisible {
+		t.Fatal("expected details to be hidden by default")
+	}
+	ui.handleKey("i")
+	if !ui.detailsVisible {
+		t.Fatal("expected i to show details")
+	}
+	if !services.configManager.Snapshot().DetailsVisible {
+		t.Fatal("expected details visibility change to persist to config")
+	}
+
+	reopened := NewPingTopUI(
+		services.runtimePaths,
+		services.configManager,
+		services.stateStore,
+		services.logger,
+		services.coordinator,
+		services.updateManager,
+	)
+	if !reopened.detailsVisible {
+		t.Fatal("expected reopened UI to use saved shown details state")
+	}
+}
+
+func TestHandleKeyETogglesAndPersistsEventVisibility(t *testing.T) {
+	tempDir := t.TempDir()
+	services, err := buildServices(pingtop.RuntimePaths{
+		ConfigPath: filepath.Join(tempDir, "pingtop.json"),
+		LogPath:    filepath.Join(tempDir, "pingtop_log.csv"),
+	}, cliArgs{})
+	if err != nil {
+		t.Fatalf("unexpected buildServices error: %v", err)
+	}
+	defer services.coordinator.Close()
+
+	ui := NewPingTopUI(
+		services.runtimePaths,
+		services.configManager,
+		services.stateStore,
+		services.logger,
+		services.coordinator,
+		services.updateManager,
+	)
+
+	if !ui.eventsVisible {
+		t.Fatal("expected events to be visible by default")
+	}
+	ui.eventScrollOffset = 3
+	ui.handleKey("e")
+	if ui.eventsVisible {
+		t.Fatal("expected e to hide events")
+	}
+	if services.configManager.Snapshot().EventsVisible {
+		t.Fatal("expected event visibility change to persist to config")
+	}
+	if ui.eventScrollOffset != 0 {
+		t.Fatalf("expected hiding events to reset event scroll offset, got %d", ui.eventScrollOffset)
+	}
+
+	reopened := NewPingTopUI(
+		services.runtimePaths,
+		services.configManager,
+		services.stateStore,
+		services.logger,
+		services.coordinator,
+		services.updateManager,
+	)
+	if reopened.eventsVisible {
+		t.Fatal("expected reopened UI to use saved hidden events state")
 	}
 }
 
