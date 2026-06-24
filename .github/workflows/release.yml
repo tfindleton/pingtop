@@ -1,0 +1,193 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "*.*.*"
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: Verify release tag
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.mod
+
+      - name: Validate tag format
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! printf '%s\n' "${GITHUB_REF_NAME}" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Release tags must use X.Y.Z or vX.Y.Z format"
+            exit 1
+          fi
+
+          expected_version="${GITHUB_REF_NAME#v}"
+          actual_version="$(
+            tr -d '\r' < internal/pingtop/version.go \
+              | sed -n 's/^[[:space:]]*var[[:space:]]\+Version\([[:space:]]\+[[:alnum:]_.]*\)\{0,1\}[[:space:]]*=[[:space:]]*"\([^"]*\)".*$/\2/p' \
+              | head -n 1
+          )"
+          if [ -z "${actual_version}" ]; then
+            echo "Unable to read Version from internal/pingtop/version.go"
+            echo "Relevant lines from internal/pingtop/version.go:"
+            grep -n 'Version' internal/pingtop/version.go || true
+            exit 1
+          fi
+          if [ "${actual_version}" != "${expected_version}" ]; then
+            echo "Version mismatch: internal/pingtop/version.go has ${actual_version}, tag is ${expected_version}"
+            exit 1
+          fi
+
+      - name: Run test suite
+        run: go test ./...
+
+  build:
+    name: Build ${{ matrix.goos }}-${{ matrix.arch_label }}
+    needs: verify
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            arch_label: amd64
+            archive_ext: tar.gz
+          - goos: linux
+            goarch: arm64
+            arch_label: arm64
+            archive_ext: tar.gz
+          - goos: linux
+            goarch: arm
+            goarm: "7"
+            arch_label: armv7
+            archive_ext: tar.gz
+          - goos: darwin
+            goarch: amd64
+            arch_label: amd64
+            archive_ext: tar.gz
+          - goos: darwin
+            goarch: arm64
+            arch_label: arm64
+            archive_ext: tar.gz
+          - goos: windows
+            goarch: amd64
+            arch_label: amd64
+            archive_ext: zip
+          - goos: windows
+            goarch: arm64
+            arch_label: arm64
+            archive_ext: zip
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.mod
+
+      - name: Build release archive
+        id: package
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: 0
+          TAG: ${{ github.ref_name }}
+          REPOSITORY_URL: https://github.com/${{ github.repository }}
+          ARCHIVE_EXT: ${{ matrix.archive_ext }}
+          ARCH_LABEL: ${{ matrix.arch_label }}
+        run: |
+          set -euo pipefail
+
+          version="${TAG#v}"
+          binary_name="pingtop"
+          if [ "${GOOS}" = "windows" ]; then
+            binary_name="${binary_name}.exe"
+          fi
+
+          package_name="pingtop_${TAG}_${GOOS}_${ARCH_LABEL}"
+          staging_dir="dist/${package_name}"
+          mkdir -p "${staging_dir}"
+
+          go build \
+            -trimpath \
+            -ldflags "-s -w -X github.com/tfindleton/pingtop/internal/pingtop.Version=${version} -X github.com/tfindleton/pingtop/internal/pingtop.DefaultUpdateRepoURL=${REPOSITORY_URL}" \
+            -o "${staging_dir}/${binary_name}" \
+            .
+
+          cp README.md "${staging_dir}/README.md"
+          if [ -f License.txt ]; then
+            cp License.txt "${staging_dir}/License.txt"
+          fi
+
+          archive_path="dist/${package_name}.${ARCHIVE_EXT}"
+          if [ "${ARCHIVE_EXT}" = "zip" ]; then
+            (
+              cd dist
+              zip -rq "${package_name}.zip" "${package_name}"
+            )
+          else
+            tar -C dist -czf "${archive_path}" "${package_name}"
+          fi
+
+          echo "archive_path=${archive_path}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.goos }}-${{ matrix.arch_label }}
+          path: ${{ steps.package.outputs.archive_path }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum * > SHA256SUMS.txt
+
+      - name: Create or update GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "${TAG}" --repo "${REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" release-assets/* --repo "${REPOSITORY}" --clobber
+          else
+            gh release create "${TAG}" release-assets/* --repo "${REPOSITORY}" --generate-notes --verify-tag --title "${TAG}"
+          fi

@@ -1,19 +1,19 @@
 # pingtop
 
 <p>
-  <a href="https://github.com/Landmine-1252/pingtop-go/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/landmine-1252/pingtop-go/ci.yml?branch=main&label=ci&logo=githubactions"></a>
-  <a href="https://github.com/Landmine-1252/pingtop-go/blob/main/go.mod"><img alt="Go Version" src="https://img.shields.io/github/go-mod/go-version/landmine-1252/pingtop-go?logo=go"></a>
-  <a href="https://goreportcard.com/report/github.com/landmine-1252/pingtop-go"><img alt="Go Report Card" src="https://goreportcard.com/badge/github.com/landmine-1252/pingtop-go"></a>
+  <a href="https://github.com/tfindleton/pingtop/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/tfindleton/pingtop/ci.yml?branch=main&label=ci&logo=githubactions"></a>
+  <a href="https://github.com/tfindleton/pingtop/blob/main/go.mod"><img alt="Go Version" src="https://img.shields.io/github/go-mod/go-version/tfindleton/pingtop?logo=go"></a>
+  <a href="https://goreportcard.com/report/github.com/tfindleton/pingtop"><img alt="Go Report Card" src="https://goreportcard.com/badge/github.com/tfindleton/pingtop"></a>
 </p>
 
 <p>
-  <a href="https://github.com/Landmine-1252/pingtop-go/releases"><img alt="Release" src="https://img.shields.io/github/v/release/landmine-1252/pingtop-go?display_name=tag&sort=semver&logo=github"></a>
-  <a href="https://github.com/Landmine-1252/pingtop-go/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/landmine-1252/pingtop-go/latest/total?logo=github"></a>
-  <a href="https://github.com/Landmine-1252/pingtop-go/releases"><img alt="Platforms" src="https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20windows-1f2937"></a>
-  <a href="https://github.com/Landmine-1252/pingtop-go/releases"><img alt="Arch" src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64%20%7C%20armv7-2563eb"></a>
+  <a href="https://github.com/tfindleton/pingtop/releases"><img alt="Release" src="https://img.shields.io/github/v/release/tfindleton/pingtop?display_name=tag&sort=semver&logo=github"></a>
+  <a href="https://github.com/tfindleton/pingtop/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/tfindleton/pingtop/latest/total?logo=github"></a>
+  <a href="https://github.com/tfindleton/pingtop/releases"><img alt="Platforms" src="https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20windows-1f2937"></a>
+  <a href="https://github.com/tfindleton/pingtop/releases"><img alt="Arch" src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64%20%7C%20armv7-2563eb"></a>
 </p>
 
-`pingtop` is a Go rewrite of the original Python [`pingtop`](https://github.com/Landmine-1252/pingtop).
+`pingtop` is a terminal network monitor written in Go.
 
 ![pingtop demo](demo.gif)
 
@@ -22,12 +22,13 @@
 - live terminal UI with redraws, color, and keyboard controls
 - concurrent ping and DNS checks with simple failure classification
 - interactive mode and headless mode
+- quiet logging modes, including only state changes or no logging
 - single-binary releases for Linux, macOS, and Windows
 - ad hoc target runs from the command line without writing CSV logs
 
 ## Downloads
 
-Prebuilt binaries are published on [GitHub Releases](https://github.com/Landmine-1252/pingtop-go/releases).
+Prebuilt binaries are published on [GitHub Releases](https://github.com/tfindleton/pingtop/releases).
 
 - platforms: Linux, macOS, Windows
 - architectures: `amd64`, `arm64`, Linux `armv7`
@@ -80,7 +81,7 @@ To debug update detection without publishing a new release, run:
 pingtop -u
 pingtop --updates
 pingtop -u --current-version 0.1.3
-pingtop --check-updates --current-version 0.1.3 --update-repo https://github.com/Landmine-1252/pingtop-go
+pingtop --check-updates --current-version 0.1.3 --update-repo https://github.com/tfindleton/pingtop
 ```
 
 ## Controls
@@ -98,9 +99,9 @@ The interactive UI starts with help visible by default and remembers the last he
 - `PgUp` / `PgDn`: page through event history
 
 **Tuning**
-- `l`: cycle logging mode
-- `+` / `-`: increase or decrease the check interval
-- `<` / `>`: adjust the UI refresh rate
+- `l`: cycle logging mode (`around_failure`, `changes_only`, `failures_only`, `all`, `off`)
+- `+` / `-`: increase or decrease the check interval (`0.50s` to `300.00s`)
+- `<` / `>`: decrease or increase the UI refresh interval (`0.10s` to `5.00s`)
 - `w`: set the around-failure window
 - `t`: set the stats window
 
