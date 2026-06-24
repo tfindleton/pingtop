@@ -141,8 +141,8 @@ func (monitor *BackgroundMonitor) run() {
 		generation := atomic.LoadInt64(&monitor.generation)
 		ctx, cancel := monitor.newCycleContext()
 		monitor.stateStore.BeginCycle(cycleID, generation, config, time.Now())
-		results := monitor.coordinator.ExecuteCycleContext(ctx, config, cycleID, func() {
-			monitor.stateStore.NoteCycleProgress(cycleID, generation)
+		results := monitor.coordinator.ExecuteCycleContext(ctx, config, cycleID, func(result CheckResult) {
+			monitor.stateStore.NoteCycleProgress(cycleID, generation, result)
 		})
 		cycleCanceled := ctx.Err() != nil
 		monitor.clearCycleContext(cancel)

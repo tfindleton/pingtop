@@ -246,7 +246,7 @@ func (coordinator *CheckCoordinator) ExecuteCycle(config AppConfig, cycleID int)
 	return coordinator.ExecuteCycleContext(context.Background(), config, cycleID, nil)
 }
 
-func (coordinator *CheckCoordinator) ExecuteCycleContext(ctx context.Context, config AppConfig, cycleID int, onProgress func()) []CheckResult {
+func (coordinator *CheckCoordinator) ExecuteCycleContext(ctx context.Context, config AppConfig, cycleID int, onProgress func(CheckResult)) []CheckResult {
 	if len(config.Targets) == 0 {
 		return nil
 	}
@@ -267,7 +267,7 @@ func (coordinator *CheckCoordinator) ExecuteCycleContext(ctx context.Context, co
 		case item := <-resultCh:
 			results[item.index] = item.result
 			if onProgress != nil {
-				onProgress()
+				onProgress(item.result)
 			}
 		case <-ctx.Done():
 			return nil

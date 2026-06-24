@@ -190,7 +190,7 @@ func (store *StateStore) BeginCycle(cycleID int, generation int64, config AppCon
 	store.revision++
 }
 
-func (store *StateStore) NoteCycleProgress(cycleID int, generation int64) {
+func (store *StateStore) NoteCycleProgress(cycleID int, generation int64, result CheckResult) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	if !store.activeCycle.Active || store.activeCycle.CycleID != cycleID || store.activeCycle.Generation != generation {
@@ -198,6 +198,9 @@ func (store *StateStore) NoteCycleProgress(cycleID int, generation int64) {
 	}
 	if store.activeCycle.CompletedChecks < store.activeCycle.TotalChecks {
 		store.activeCycle.CompletedChecks++
+	}
+	if stats := store.stats[result.Target]; stats != nil {
+		stats.Checking = false
 	}
 	store.revision++
 }

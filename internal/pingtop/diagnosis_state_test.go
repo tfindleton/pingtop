@@ -152,7 +152,7 @@ func TestStateStoreIgnoresProgressFromOldGeneration(t *testing.T) {
 	store.BeginCycle(1, 1, config, time.Unix(1, 0))
 	store.ClearActiveCycle()
 	store.BeginCycle(2, 2, config, time.Unix(2, 0))
-	store.NoteCycleProgress(1, 1)
+	store.NoteCycleProgress(1, 1, makeResult("1.1.1.1", "ip", 1, 1, true, nil, "1.1.1.1", "ok", nil))
 
 	snapshot := store.Snapshot()
 	if !snapshot.ActiveCycle.Active || snapshot.ActiveCycle.CycleID != 2 || snapshot.ActiveCycle.Generation != 2 {
@@ -163,6 +163,29 @@ func TestStateStoreIgnoresProgressFromOldGeneration(t *testing.T) {
 	}
 	if !snapshot.TargetStats[0].Checking {
 		t.Fatal("expected current generation target to remain checking")
+	}
+}
+
+func TestStateStoreClearsCheckingForCompletedTargetOnly(t *testing.T) {
+	config := defaultConfig()
+	config.Targets = []TargetSpec{
+		{Value: "1.1.1.1", Kind: "ip"},
+		{Value: "8.8.8.8", Kind: "ip"},
+	}
+	store := NewStateStore(config)
+
+	store.BeginCycle(1, 1, config, time.Unix(1, 0))
+	store.NoteCycleProgress(1, 1, makeResult("1.1.1.1", "ip", 1, 1, true, nil, "1.1.1.1", "ok", nil))
+
+	snapshot := store.Snapshot()
+	if snapshot.ActiveCycle.CompletedChecks != 1 {
+		t.Fatalf("expected one completed check, got %d", snapshot.ActiveCycle.CompletedChecks)
+	}
+	if snapshot.TargetStats[0].Checking {
+		t.Fatal("expected completed target to stop showing checking")
+	}
+	if !snapshot.TargetStats[1].Checking {
+		t.Fatal("expected unfinished target to remain checking")
 	}
 }
 

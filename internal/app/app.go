@@ -521,8 +521,6 @@ func (ui *PingTopUI) syncUpdateStatus() {
 	ui.dirty = true
 	if status.State == "available" {
 		ui.stateStore.AddEvent("info", fmt.Sprintf("Update available: %s (press u to review release)", status.LatestVersion), time.Time{})
-	} else if status.State == "error" {
-		ui.stateStore.AddEvent("warn", "Update check failed: "+pingtop.Shorten(status.ErrorMessage, 120), time.Time{})
 	}
 }
 

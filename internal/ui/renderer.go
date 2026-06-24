@@ -923,7 +923,7 @@ func (renderer *Renderer) updateStatusColor(status UpdateStatus) string {
 	case "current":
 		return "green"
 	case "error":
-		return "red"
+		return "yellow"
 	default:
 		return ""
 	}

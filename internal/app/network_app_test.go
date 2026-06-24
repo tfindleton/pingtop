@@ -1,6 +1,7 @@
 package app
 
 import (
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"github.com/tfindleton/pingtop/internal/checks"
 	"github.com/tfindleton/pingtop/internal/pingtop"
 	termui "github.com/tfindleton/pingtop/internal/ui"
+	updatespkg "github.com/tfindleton/pingtop/internal/updates"
 )
 
 func TestRunHeadlessOncePrintsSummary(t *testing.T) {
@@ -288,6 +290,44 @@ func TestHandleKeyFForcesFreshCheck(t *testing.T) {
 	}
 	if message := latestEventMessage(services.stateStore); !strings.Contains(message, "Forced fresh check cycle") {
 		t.Fatalf("expected force refresh event, got %q", message)
+	}
+}
+
+func TestSyncUpdateStatusDoesNotLogTransientUpdateErrors(t *testing.T) {
+	tempDir := t.TempDir()
+	services, err := buildServices(pingtop.RuntimePaths{
+		ConfigPath: filepath.Join(tempDir, "pingtop.json"),
+		LogPath:    filepath.Join(tempDir, "pingtop_log.csv"),
+	}, cliArgs{})
+	if err != nil {
+		t.Fatalf("unexpected buildServices error: %v", err)
+	}
+	defer services.coordinator.Close()
+
+	updateManager := updatespkg.NewUpdateManager(
+		"0.2.0",
+		"https://github.com/tfindleton/pingtop",
+		true,
+		func(repoURL string, timeout time.Duration) (string, string, error) {
+			return "", "", errors.New("update check timed out after 10s")
+		},
+	)
+	updateManager.CheckNow()
+	ui := NewPingTopUI(
+		services.runtimePaths,
+		services.configManager,
+		services.stateStore,
+		services.logger,
+		services.coordinator,
+		updateManager,
+	)
+
+	ui.syncUpdateStatus()
+
+	for _, event := range services.stateStore.Snapshot().RecentEvents {
+		if strings.Contains(event.Message, "Update check failed") {
+			t.Fatalf("unexpected update failure event: %#v", event)
+		}
 	}
 }
 

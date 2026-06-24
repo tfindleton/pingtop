@@ -49,6 +49,13 @@ func TestBuildReleaseAPIURLRequiresGitHubRepo(t *testing.T) {
 	}
 }
 
+func TestErrorStatusSummarizesAsUnavailable(t *testing.T) {
+	status := UpdateStatus{State: "error", ErrorMessage: "update check timed out"}
+	if got := status.Summary(); got != "unavailable" {
+		t.Fatalf("expected unavailable summary for transient update errors, got %q", got)
+	}
+}
+
 func TestUpdateManagerMarksAvailableVersion(t *testing.T) {
 	manager := NewUpdateManager(
 		"0.1.0",
@@ -62,6 +69,23 @@ func TestUpdateManagerMarksAvailableVersion(t *testing.T) {
 	status := manager.Snapshot()
 	if status.State != "available" || status.LatestVersion != "0.2.0" {
 		t.Fatalf("unexpected update status: %#v", status)
+	}
+}
+
+func TestUpdateManagerUsesDefaultRequestTimeout(t *testing.T) {
+	var gotTimeout time.Duration
+	manager := NewUpdateManager(
+		"0.2.0",
+		"https://github.com/tfindleton/pingtop",
+		true,
+		func(repoURL string, timeout time.Duration) (string, string, error) {
+			gotTimeout = timeout
+			return "0.2.0", "https://github.com/tfindleton/pingtop/releases/tag/0.2.0", nil
+		},
+	)
+	manager.run()
+	if gotTimeout != defaultUpdateRequestTimeout {
+		t.Fatalf("expected update request timeout %s, got %s", defaultUpdateRequestTimeout, gotTimeout)
 	}
 }
 

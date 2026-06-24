@@ -1,6 +1,7 @@
 package updates
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,7 +17,10 @@ import (
 
 var versionTagRE = regexp.MustCompile(`^v?(\d+)\.(\d+)\.(\d+)$`)
 
-const defaultUpdateCheckInterval = 5 * time.Minute
+const (
+	defaultUpdateCheckInterval  = 5 * time.Minute
+	defaultUpdateRequestTimeout = 10 * time.Second
+)
 
 type UpdateStatus struct {
 	State          string
@@ -45,7 +49,7 @@ func (status UpdateStatus) Summary() string {
 	case "current":
 		return "current"
 	case "error":
-		return "check failed"
+		return "unavailable"
 	default:
 		return "-"
 	}
@@ -125,9 +129,21 @@ func fetchLatestRelease(repoURL string, timeout time.Duration) (string, string, 
 	client := &http.Client{Timeout: timeout}
 	response, err := client.Do(request)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return "", "", fmt.Errorf("update check timed out after %s", timeout)
+		}
 		return "", "", err
 	}
 	defer response.Body.Close()
+	if response.StatusCode == http.StatusNotFound {
+		return "", "", errors.New("no GitHub releases found for update checks")
+	}
+	if response.StatusCode == http.StatusForbidden || response.StatusCode == http.StatusTooManyRequests {
+		return "", "", fmt.Errorf("GitHub API rate limited update checks (HTTP %d)", response.StatusCode)
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return "", "", fmt.Errorf("GitHub update check returned HTTP %d", response.StatusCode)
+	}
 
 	var payload struct {
 		TagName string `json:"tag_name"`
@@ -269,7 +285,7 @@ func (manager *UpdateManager) run() {
 		ReleaseURL:     manager.repoURL + "/releases",
 	}
 
-	latestVersion, releaseURL, err := manager.fetcher(manager.repoURL, 3*time.Second)
+	latestVersion, releaseURL, err := manager.fetcher(manager.repoURL, defaultUpdateRequestTimeout)
 	if err != nil {
 		nextStatus = UpdateStatus{
 			State:          "error",
