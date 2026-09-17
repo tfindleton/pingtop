@@ -159,6 +159,9 @@ type TargetStats struct {
 	LastResolvedIP       string
 	LastErrorCategory    string
 	LastErrorMessage     string
+	LastFailureAt        time.Time
+	LastFailureCategory  string
+	LastFailureMessage   string
 	LastCheckedAt        time.Time
 	WindowSummary        CounterSummary
 }
@@ -174,6 +177,11 @@ func (stats *TargetStats) Apply(result CheckResult) (string, string) {
 	}
 	stats.LastErrorCategory = result.ErrorCategory
 	stats.LastErrorMessage = result.ErrorMessage
+	if result.IsFailure() {
+		stats.LastFailureAt = result.Timestamp
+		stats.LastFailureCategory = result.ErrorCategory
+		stats.LastFailureMessage = result.ErrorMessage
+	}
 
 	if result.DNSSuccess != nil && !*result.DNSSuccess {
 		stats.FailureCount++
@@ -222,6 +230,9 @@ func (stats *TargetStats) ResetCounters() {
 	stats.ConsecutiveFailures = 0
 	stats.ConsecutiveSuccesses = 0
 	stats.RecoveryPending = false
+	stats.LastFailureAt = time.Time{}
+	stats.LastFailureCategory = ""
+	stats.LastFailureMessage = ""
 }
 
 type SessionTotals struct {

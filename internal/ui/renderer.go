@@ -23,6 +23,7 @@ var (
 	formatCompactSpan    = pingtop.FormatCompactSpan
 	formatDuration       = pingtop.FormatDuration
 	formatLatency        = pingtop.FormatLatency
+	formatLossPercentage = pingtop.FormatLossPercentage
 	formatTimestampShort = pingtop.FormatTimestampShort
 	nowLocalISO          = pingtop.NowLocalISO
 	shorten              = pingtop.Shorten
@@ -68,10 +69,15 @@ type targetTableLayout struct {
 type Renderer struct {
 	ansi                  bool
 	lastRenderedLineCount int
+	csvDisabled           bool
 }
 
 func NewRenderer() *Renderer {
 	return &Renderer{ansi: enableANSI(os.Stdout)}
+}
+
+func (renderer *Renderer) SetCSVLoggingAvailable(available bool) {
+	renderer.csvDisabled = !available
 }
 
 func (renderer *Renderer) Enter() {
@@ -257,11 +263,22 @@ func (renderer *Renderer) EventScrollState(
 }
 
 func (renderer *Renderer) BuildReport(snapshot StateSnapshot, config AppConfig, paused bool) string {
+	previousANSI := renderer.ansi
+	renderer.ansi = false
+	defer func() { renderer.ansi = previousANSI }()
+
 	width := 180
+	csvStatus := "enabled"
+	if renderer.csvDisabled {
+		csvStatus = "disabled (command-line targets)"
+	} else if config.LoggingMode == pingtop.LoggingModeOff {
+		csvStatus = "off (not saved)"
+	}
 	header := []string{
 		"pingtop session snapshot - " + nowLocalISO(timeNow(), false),
 		"status: " + ternaryString(paused, "paused", "running"),
 		"diagnosis: " + snapshot.Diagnosis,
+		"csv_logging: " + csvStatus,
 		fmt.Sprintf(
 			"check_interval_seconds=%.2f, ping_timeout_ms=%d, stats_window_seconds=%d, ui_refresh_interval_seconds=%.2f, diagnosis_confirm_cycles=%d, recovery_confirm_cycles=%d, latency_warning_ms=%d, latency_critical_ms=%d, log_rotation_max_mb=%d, log_rotation_keep_files=%d, logging_mode=%s, around_failure=%d/%ds, visible_event_lines=%d",
 			config.CheckIntervalSeconds,
@@ -299,6 +316,18 @@ func (renderer *Renderer) BuildReport(snapshot StateSnapshot, config AppConfig, 
 	}
 	visibleEvents := renderer.visibleEvents(snapshot.RecentEvents, config)
 	body := renderer.buildTargetTable(snapshot.TargetStats, width, config, false, -1)
+	failureHistory := []string{}
+	for _, stats := range snapshot.TargetStats {
+		if stats.LastFailureAt.IsZero() {
+			continue
+		}
+		text := fmt.Sprintf("%s at %s: %s", stats.Target, nowLocalISO(stats.LastFailureAt, false), renderer.lastFailureReason(stats))
+		failureHistory = append(failureHistory, renderer.wrapText("Failure", text, width, "yellow")...)
+	}
+	if len(failureHistory) > 0 {
+		body = append(body, "", "Last failures since counter reset")
+		body = append(body, failureHistory...)
+	}
 	events := []string{"", "Recent events"}
 	shownLines := minInt(15, config.VisibleEventLines)
 	start := maxInt(0, len(visibleEvents)-shownLines)
@@ -334,6 +363,18 @@ func (renderer *Renderer) buildScreenChrome(
 	rotationLabel := "off"
 	if config.LogRotationMaxMB > 0 {
 		rotationLabel = fmt.Sprintf("%dMB/%d", config.LogRotationMaxMB, config.LogRotationKeepFiles)
+	}
+	loggingLabel := config.LoggingMode
+	loggingColor := ""
+	loggingAction := "logging"
+	if renderer.csvDisabled {
+		loggingLabel = config.LoggingMode + " (CSV disabled; ad hoc)"
+		loggingColor = "yellow"
+		loggingAction = "event logging"
+	} else if config.LoggingMode == pingtop.LoggingModeOff {
+		loggingLabel = "off (no CSV)"
+		loggingColor = "yellow"
+		loggingAction = "enable logging"
 	}
 
 	visibleEvents := renderer.visibleEvents(snapshot.RecentEvents, config)
@@ -373,7 +414,7 @@ func (renderer *Renderer) buildScreenChrome(
 			renderer.kvPair("stats", windowLabel, "white", ""),
 			renderer.kvPair("confirm", fmt.Sprintf("%d/%d", config.DiagnosisConfirmCycles, config.RecoveryConfirmCycles), "white", ""),
 			renderer.kvPair("latency", fmt.Sprintf("%d/%dms", config.LatencyWarningMS, config.LatencyCriticalMS), "white", ""),
-			renderer.kvPair("logging", config.LoggingMode, "white", ""),
+			renderer.kvPair("logging", loggingLabel, "white", loggingColor),
 			renderer.kvPair("rotate", rotationLabel, "white", ""),
 		}, width, "cyan")...,
 	)
@@ -422,7 +463,7 @@ func (renderer *Renderer) buildScreenChrome(
 		)
 		footerLines = append(footerLines,
 			renderer.wrapPairs("Tuning", []textPair{
-				renderer.shortcutPair("l", "logging"),
+				renderer.shortcutPair("l", loggingAction),
 				renderer.shortcutPair("+/-", "check"),
 				renderer.shortcutPair("</>", "refresh -/+"),
 				renderer.shortcutPair("w", "fail window"),
@@ -447,11 +488,15 @@ func (renderer *Renderer) buildScreenChrome(
 			renderer.wrapPairs("Events", eventShortcuts, width, "cyan")...,
 		)
 	} else {
+		helpShortcuts := []textPair{
+			renderer.shortcutPair("h", "show help"),
+			renderer.shortcutPair("q/Esc", "quit"),
+		}
+		if !renderer.csvDisabled && config.LoggingMode == pingtop.LoggingModeOff {
+			helpShortcuts = append(helpShortcuts, renderer.shortcutPair("l", loggingAction))
+		}
 		footerLines = append(footerLines,
-			renderer.wrapPairs("Help", []textPair{
-				renderer.shortcutPair("h", "show help"),
-				renderer.shortcutPair("q/Esc", "quit"),
-			}, width, "cyan")...,
+			renderer.wrapPairs("Help", helpShortcuts, width, "cyan")...,
 		)
 	}
 
@@ -722,7 +767,7 @@ func (renderer *Renderer) buildTargetDetailsBlock(statsList []TargetStats, confi
 		renderer.kvPair("fail", abbreviateCount(stats.FailureCount), "white", ternaryString(stats.FailureCount > 0, "red", "green")),
 		renderer.kvPair("dns", abbreviateCount(stats.DNSFailureCount), "white", ternaryString(stats.DNSFailureCount > 0, "yellow", "green")),
 		renderer.kvPair("ping", abbreviateCount(stats.PingFailureCount), "white", ternaryString(stats.PingFailureCount > 0, "yellow", "green")),
-		renderer.kvPair("loss", fmt.Sprintf("%.1f%%", stats.PacketLossPercentage()), "white", renderer.lossColor(stats.PacketLossPercentage())),
+		renderer.kvPair("loss", formatLossPercentage(stats.PacketLossPercentage()), "white", renderer.lossColor(stats.PacketLossPercentage())),
 		renderer.kvPair(formatCompactSpan(config.StatsWindowSeconds), abbreviateRatio(stats.WindowSummary.Successes, stats.WindowSummary.Failures), "white", ternaryString(stats.WindowSummary.Failures > 0, "red", "green")),
 	}, width, "cyan")...)
 	lines = append(lines, renderer.wrapPairs("Last", []textPair{
@@ -736,12 +781,30 @@ func (renderer *Renderer) buildTargetDetailsBlock(statsList []TargetStats, confi
 	errorText := renderer.targetErrorText(stats)
 	if errorText == "" {
 		lines = append(lines, renderer.wrapPairs("Error", []textPair{
-			renderer.kvPair("last", "none", "white", "green"),
+			renderer.kvPair("current", "none", "white", "green"),
 		}, width, "cyan")...)
-		return lines
+	} else {
+		lines = append(lines, renderer.wrapText("Error", errorText, width, "red")...)
 	}
-	lines = append(lines, renderer.wrapText("Error", errorText, width, "red")...)
+	if stats.LastFailureAt.IsZero() {
+		lines = append(lines, renderer.wrapPairs("Failure", []textPair{
+			renderer.kvPair("last", "none since reset", "white", ""),
+		}, width, "cyan")...)
+	} else {
+		text := fmt.Sprintf("last %s: %s", stats.LastFailureAt.Local().Format("2006-01-02 15:04:05"), renderer.lastFailureReason(stats))
+		lines = append(lines, renderer.wrapText("Failure", text, width, "yellow")...)
+	}
 	return lines
+}
+
+func (renderer *Renderer) lastFailureReason(stats TargetStats) string {
+	if stats.LastFailureCategory == "" {
+		return defaultString(stats.LastFailureMessage, "unknown failure")
+	}
+	if stats.LastFailureMessage == "" {
+		return stats.LastFailureCategory
+	}
+	return stats.LastFailureCategory + ": " + stats.LastFailureMessage
 }
 
 func (renderer *Renderer) wrapText(label, text string, width int, color string) []string {
@@ -959,7 +1022,7 @@ func (renderer *Renderer) buildTargetTable(statsList []TargetStats, width int, c
 			false,
 		)
 		lossText := renderer.style(
-			fmt.Sprintf("%*.1f%%", layout.loss-1, stats.WindowSummary.LossPercentage()),
+			fmt.Sprintf("%*s", layout.loss, formatLossPercentage(stats.WindowSummary.LossPercentage())),
 			renderer.lossColor(stats.WindowSummary.LossPercentage()),
 			false,
 			false,
@@ -1021,7 +1084,7 @@ func (renderer *Renderer) targetTableLayout(statsList []TargetStats, width int, 
 		layout.latency = maxInt(layout.latency, len(formatLatency(stats.LastLatencyMS)))
 		layout.fail = maxInt(layout.fail, len(abbreviateCount(stats.FailureCount)))
 		layout.age = maxInt(layout.age, len(renderer.targetAge(stats)))
-		layout.loss = maxInt(layout.loss, len(fmt.Sprintf("%.1f%%", stats.WindowSummary.LossPercentage())))
+		layout.loss = maxInt(layout.loss, len(formatLossPercentage(stats.WindowSummary.LossPercentage())))
 		layout.ratio = maxInt(layout.ratio, len(abbreviateRatio(stats.WindowSummary.Successes, stats.WindowSummary.Failures)))
 	}
 

@@ -435,6 +435,7 @@ func NewPingTopUI(
 		running:        true,
 		dirty:          true,
 	}
+	ui.renderer.SetCSVLoggingAvailable(logger.Enabled())
 	if warning := configManager.LoadWarning(); warning != "" {
 		stateStore.AddEvent("warn", warning, time.Time{})
 	}

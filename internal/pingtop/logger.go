@@ -53,6 +53,12 @@ func NewDisabledCSVLogger() *CSVLogger {
 	}
 }
 
+// Enabled reports whether this logger has a CSV destination. The current
+// logging mode can still suppress writes when a destination is available.
+func (logger *CSVLogger) Enabled() bool {
+	return logger != nil && logger.path != ""
+}
+
 func (logger *CSVLogger) ensureHeader() error {
 	if info, err := os.Stat(logger.path); err == nil && info.Size() > 0 {
 		return nil

@@ -91,11 +91,15 @@ pingtop --check-updates --current-version 0.1.3 --update-repo https://github.com
 
 The interactive UI starts with help and events visible and target details hidden by default. It remembers those visibility choices in `pingtop.json`.
 
-The target table's **Fail** column counts all failures for that target since the session started or counters were reset with `r`. Successful checks do not clear it. **Loss%** and **OK/Fail** use the configured rolling stats window (one hour by default), so older results expire from those columns. Press `i` to see details, including the current consecutive failure count. Counters are kept in memory; restarting the app or deleting and re-adding a target starts fresh counters.
+The target table's **Fail** column counts all failures for that target since the session started or counters were reset with `r`. Successful checks do not clear it. **Loss%** and **OK/Fail** use the configured rolling stats window (one hour by default), so older results expire from those columns. Small, nonzero loss is shown as `<0.1%`; only zero loss is shown as `0.0%`. Latencies below one millisecond are displayed as `<1ms`.
+
+Press `i` to see details, including the current consecutive failure count and the most recent failure's date, time, and reason. That failure remains available after recovery and rolling-window expiry, even with logging off, and is included in saved snapshots. Pressing `r` clears it with the counters. Counters and last-failure details are kept in memory; restarting the app or deleting and re-adding a target starts fresh history.
 
 Runtime files are written next to the `pingtop` executable: `pingtop.json` for targets and settings, `pingtop_log.csv` for CSV logs, and `pingtop_snapshot_*.txt` for snapshots. When running with `go run`, pingtop uses the launch/current directory instead of Go's temporary build directory.
 
 CSV write errors are reported, with up to 10,000 unsaved rows kept in memory for retry. Queue overflow drops the oldest unsaved rows with a warning. Retries are best effort and partial writes can produce duplicate rows; pending rows do not survive a restart or switching logging off.
+
+The UI shows `off (no CSV)` when logging is off; press `l` to enable it for future checks. Command-line target runs show the selected event-logging mode with `CSV disabled; ad hoc` because those sessions never write CSV files; `l` still changes which in-memory events are recorded. Last-failure details and manual snapshots remain available in either case.
 
 **Controls**
 - `q` or `Esc`: quit

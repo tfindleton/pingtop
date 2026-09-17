@@ -149,6 +149,9 @@ func FormatLatency(latencyMS *float64) string {
 		return "-"
 	}
 	value := *latencyMS
+	if value >= 0 && value < 1 {
+		return "<1ms"
+	}
 	if value >= 1000 {
 		return fmt.Sprintf("%.2fs", value/1000.0)
 	}
@@ -156,6 +159,16 @@ func FormatLatency(latencyMS *float64) string {
 		return fmt.Sprintf("%.0fms", value)
 	}
 	return fmt.Sprintf("%.1fms", value)
+}
+
+func FormatLossPercentage(percentage float64) string {
+	if percentage == 0 {
+		return "0.0%"
+	}
+	if percentage > 0 && percentage < 0.1 {
+		return "<0.1%"
+	}
+	return fmt.Sprintf("%.1f%%", percentage)
 }
 
 func FormatTimestampShort(value time.Time) string {
