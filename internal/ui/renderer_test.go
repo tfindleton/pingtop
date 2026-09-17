@@ -9,6 +9,34 @@ import (
 	"github.com/tfindleton/pingtop/internal/pingtop"
 )
 
+func TestTargetTableKeepsFailuresAfterRecovery(t *testing.T) {
+	renderer := &Renderer{}
+	config := pingtop.AppConfig{StatsWindowSeconds: 3600}
+	stats := pingtop.TargetStats{Target: "1.1.1.1", TargetType: "ip"}
+	for _, success := range []bool{false, false, true} {
+		category := "timeout"
+		if success {
+			category = "ok"
+		}
+		stats.Apply(pingtop.CheckResult{Timestamp: time.Now(), PingSuccess: success, ErrorCategory: category})
+	}
+	// Expiring the rolling window must also leave the session failure count visible.
+	stats.WindowSummary = pingtop.CounterSummary{}
+	lines := renderer.buildTargetTable([]TargetStats{stats}, 120, config, false, -1)
+	fields := strings.Fields(lines[2])
+	if len(fields) < 9 || fields[5] != "2" || fields[7] != "0.0%" || fields[8] != "0/0" {
+		t.Fatalf("expected cumulative Fail=2 with empty rolling stats, got %q", lines[2])
+	}
+	if !strings.Contains(lines[0], "Fail: session") || !strings.Contains(lines[0], "1h") {
+		t.Fatalf("expected the table to explain counter scopes, got %q", lines[0])
+	}
+	stats.ResetCounters()
+	lines = renderer.buildTargetTable([]TargetStats{stats}, 120, config, false, -1)
+	if got := strings.Fields(lines[2])[5]; got != "0" {
+		t.Fatalf("expected Fail=0 after explicit reset, got %q", got)
+	}
+}
+
 func TestBuildExitSummaryIncludesTitleAndRuntime(t *testing.T) {
 	renderer := &Renderer{}
 	startedAt := time.Unix(100, 0)

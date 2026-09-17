@@ -280,6 +280,14 @@ func (renderer *Renderer) BuildReport(snapshot StateSnapshot, config AppConfig, 
 			config.VisibleEventLines,
 		),
 		fmt.Sprintf(
+			"session: checks=%d, ok=%d, fail=%d, dns=%d, ping=%d",
+			snapshot.Session.TotalChecks,
+			snapshot.Session.Successes,
+			snapshot.Session.Failures,
+			snapshot.Session.DNSFailures,
+			snapshot.Session.PingFailures,
+		),
+		fmt.Sprintf(
 			"rolling_window: checks=%d, ok=%d, fail=%d, dns=%d, ping=%d",
 			snapshot.SessionWindow.Checks,
 			snapshot.SessionWindow.Successes,
@@ -871,7 +879,8 @@ func (renderer *Renderer) buildTargetTable(statsList []TargetStats, width int, c
 
 	layout := renderer.targetTableLayout(statsList, width, config)
 
-	lines := []string{renderer.style("Targets", "cyan", true, false)}
+	title := fmt.Sprintf("Targets (Fail: session; Loss%% and OK/Fail: %s)", formatCompactSpan(config.StatsWindowSeconds))
+	lines := []string{renderer.style(shorten(title, width), "cyan", true, false)}
 	header := fmt.Sprintf(
 		"%3s %-*s %-*s %-*s %*s %*s %*s %*s %*s %-*s  %s",
 		"Idx",
@@ -943,10 +952,10 @@ func (renderer *Renderer) buildTargetTable(statsList []TargetStats, width int, c
 		stateText := renderer.style(statePlain, renderer.stateColor(stats, config), stats.LastState == "down", false)
 		latencyColor := renderer.latencyColor(stats.LastLatencyMS, config)
 		latencyText := renderer.style(fmt.Sprintf("%*s", layout.latency, formatLatency(stats.LastLatencyMS)), latencyColor, latencyColor == "red", false)
-		consecutiveText := renderer.style(
-			fmt.Sprintf("%*d", layout.fail, stats.ConsecutiveFailures),
-			ternaryString(stats.ConsecutiveFailures > 0, "red", "green"),
-			stats.ConsecutiveFailures > 0,
+		failureText := renderer.style(
+			fmt.Sprintf("%*s", layout.fail, abbreviateCount(stats.FailureCount)),
+			ternaryString(stats.FailureCount > 0, "red", "green"),
+			stats.FailureCount > 0,
 			false,
 		)
 		lossText := renderer.style(
@@ -977,7 +986,7 @@ func (renderer *Renderer) buildTargetTable(statsList []TargetStats, width int, c
 			renderer.targetTypeLabel(stats.TargetType, layout.kind),
 			stateText,
 			latencyText,
-			consecutiveText,
+			failureText,
 			ageText,
 			lossText,
 			okFailText,
@@ -1010,7 +1019,7 @@ func (renderer *Renderer) targetTableLayout(statsList []TargetStats, width int, 
 		longestIP = maxInt(longestIP, len(defaultString(stats.LastResolvedIP, "-")))
 		layout.state = maxInt(layout.state, len(renderer.targetStateLabel(stats, config)))
 		layout.latency = maxInt(layout.latency, len(formatLatency(stats.LastLatencyMS)))
-		layout.fail = maxInt(layout.fail, len(fmt.Sprintf("%d", stats.ConsecutiveFailures)))
+		layout.fail = maxInt(layout.fail, len(abbreviateCount(stats.FailureCount)))
 		layout.age = maxInt(layout.age, len(renderer.targetAge(stats)))
 		layout.loss = maxInt(layout.loss, len(fmt.Sprintf("%.1f%%", stats.WindowSummary.LossPercentage())))
 		layout.ratio = maxInt(layout.ratio, len(abbreviateRatio(stats.WindowSummary.Successes, stats.WindowSummary.Failures)))

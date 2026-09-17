@@ -3,11 +3,18 @@
 package checks
 
 import (
+	"context"
 	"encoding/binary"
 	"net"
 	"syscall"
 	"unsafe"
 )
+
+func nativePingContext(ctx context.Context, ipAddress string, timeoutMS int) (bool, *float64, string, string, bool) {
+	return runNativePingContext(ctx, func() (bool, *float64, string, string, bool) {
+		return nativePing(ipAddress, timeoutMS)
+	})
+}
 
 const (
 	ipSuccess     = 0
@@ -71,11 +78,21 @@ func nativePing(ipAddress string, timeoutMS int) (bool, *float64, string, string
 		uintptr(len(replyBuffer)),
 		uintptr(timeoutMS),
 	)
+	return parseICMPReply(result, replyBuffer, callErr)
+}
+
+func parseICMPReply(result uintptr, replyBuffer []byte, callErr error) (bool, *float64, string, string, bool) {
 	if result == 0 {
+		// The native API reports timeouts and unreachable destinations through
+		// GetLastError when no replies arrive. Retrying with the ping command
+		// would conceal a lost probe if that second probe succeeds.
 		if errno, ok := callErr.(syscall.Errno); ok && errno != 0 {
-			return false, nil, "", "", false
+			if errno == ipReqTimedOut {
+				return false, nil, "timeout", "Request timed out", true
+			}
+			return false, nil, "ping_failure", errno.Error(), true
 		}
-		return false, nil, "", "", false
+		return false, nil, "ping_failure", "No ICMP echo reply received", true
 	}
 
 	reply := (*icmpEchoReply)(unsafe.Pointer(&replyBuffer[0]))

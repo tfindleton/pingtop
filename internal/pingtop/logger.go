@@ -1,7 +1,9 @@
 package pingtop
 
 import (
+	"bytes"
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +12,8 @@ import (
 	"sync"
 	"time"
 )
+
+const maxPendingLogResults = 10000
 
 var csvFieldNames = []string{
 	"timestamp",
@@ -33,6 +37,7 @@ type CSVLogger struct {
 	captureUntil time.Time
 	currentMode  string
 	lastChanges  map[string]string
+	pending      []CheckResult
 }
 
 func NewCSVLogger(path string) *CSVLogger {
@@ -48,26 +53,33 @@ func NewDisabledCSVLogger() *CSVLogger {
 	}
 }
 
-func (logger *CSVLogger) ensureHeader() {
+func (logger *CSVLogger) ensureHeader() error {
 	if info, err := os.Stat(logger.path); err == nil && info.Size() > 0 {
-		return
+		return nil
+	} else if err != nil && !os.IsNotExist(err) {
+		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(logger.path), 0o755); err != nil {
-		return
+		return err
 	}
 	file, err := os.OpenFile(logger.path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
-		return
+		return err
 	}
-	defer file.Close()
 	writer := csv.NewWriter(file)
-	_ = writer.Write(csvFieldNames)
+	if err := writer.Write(csvFieldNames); err != nil {
+		return errors.Join(err, file.Truncate(0), file.Close())
+	}
 	writer.Flush()
+	if err := writer.Error(); err != nil {
+		return errors.Join(err, file.Truncate(0), file.Close())
+	}
+	return file.Close()
 }
 
-func (logger *CSVLogger) LogResults(results []CheckResult, config AppConfig) {
+func (logger *CSVLogger) LogResults(results []CheckResult, config AppConfig) error {
 	if logger.path == "" {
-		return
+		return nil
 	}
 	logger.mu.Lock()
 	defer logger.mu.Unlock()
@@ -77,13 +89,24 @@ func (logger *CSVLogger) LogResults(results []CheckResult, config AppConfig) {
 		logger.captureUntil = time.Time{}
 		logger.currentMode = config.LoggingMode
 		logger.lastChanges = nil
-		return
+		clear(logger.pending)
+		logger.pending = nil
+		return nil
 	}
 	if logger.currentMode != config.LoggingMode {
 		logger.buffer = logger.buffer[:0]
 		logger.captureUntil = time.Time{}
 		logger.lastChanges = nil
 		logger.currentMode = config.LoggingMode
+	}
+
+	if config.LoggingMode == LoggingModeAroundFailure && len(results) > 1 {
+		// Concurrent checks are returned in target order. Process their completion
+		// times in order so a later success cannot prune an earlier failure's context.
+		results = append([]CheckResult(nil), results...)
+		sort.SliceStable(results, func(i, j int) bool {
+			return results[i].Timestamp.Before(results[j].Timestamp)
+		})
 	}
 
 	rows := make([]CheckResult, 0, len(results))
@@ -103,9 +126,19 @@ func (logger *CSVLogger) LogResults(results []CheckResult, config AppConfig) {
 			rows = append(rows, logger.logAroundFailure(result, config)...)
 		}
 	}
-	if len(rows) > 0 {
-		logger.writeRows(rows, config)
+	logger.pending = append(logger.pending, rows...)
+	if err := logger.writeRows(logger.pending, config); err != nil {
+		if dropped := len(logger.pending) - maxPendingLogResults; dropped > 0 {
+			copy(logger.pending, logger.pending[dropped:])
+			clear(logger.pending[maxPendingLogResults:])
+			logger.pending = logger.pending[:maxPendingLogResults]
+			return fmt.Errorf("CSV log write failed: %w; dropped %d oldest unsaved rows (retry limit %d)", err, dropped, maxPendingLogResults)
+		}
+		return fmt.Errorf("CSV log write failed: %w", err)
 	}
+	clear(logger.pending)
+	logger.pending = logger.pending[:0]
+	return nil
 }
 
 func (logger *CSVLogger) logAroundFailure(result CheckResult, config AppConfig) []CheckResult {
@@ -184,20 +217,19 @@ func (logger *CSVLogger) flushBuffer() []CheckResult {
 	return rows
 }
 
-func (logger *CSVLogger) writeRows(results []CheckResult, config AppConfig) {
+func (logger *CSVLogger) writeRows(results []CheckResult, config AppConfig) error {
 	if len(results) == 0 {
-		return
+		return nil
 	}
-	logger.rotateIfNeeded(config)
-	logger.ensureHeader()
-
-	file, err := os.OpenFile(logger.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return
+	if err := logger.rotateIfNeeded(config); err != nil {
+		return err
 	}
-	defer file.Close()
+	if err := logger.ensureHeader(); err != nil {
+		return err
+	}
 
-	writer := csv.NewWriter(file)
+	var payload bytes.Buffer
+	writer := csv.NewWriter(&payload)
 	for _, result := range results {
 		record := []string{
 			NowLocalISO(result.Timestamp, true),
@@ -213,19 +245,41 @@ func (logger *CSVLogger) writeRows(results []CheckResult, config AppConfig) {
 			fmt.Sprintf("%d", result.CycleID),
 			fmt.Sprintf("%d", result.Sequence),
 		}
-		_ = writer.Write(record)
+		if err := writer.Write(record); err != nil {
+			return err
+		}
 	}
 	writer.Flush()
+	if err := writer.Error(); err != nil {
+		return err
+	}
+
+	file, err := os.OpenFile(logger.path, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write(payload.Bytes()); err != nil {
+		// Retrying after a partial write can repeat rows, but truncating would risk
+		// removing rows concurrently appended by another pingtop process.
+		return errors.Join(err, file.Close())
+	}
+	return file.Close()
 }
 
-func (logger *CSVLogger) rotateIfNeeded(config AppConfig) {
+func (logger *CSVLogger) rotateIfNeeded(config AppConfig) error {
 	maxBytes := int64(config.LogRotationMaxMB) * 1024 * 1024
 	if maxBytes <= 0 {
-		return
+		return nil
 	}
 	info, err := os.Stat(logger.path)
-	if err != nil || info.Size() < maxBytes {
-		return
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Size() < maxBytes {
+		return nil
 	}
 
 	timestamp := time.Now().Format("20060102_150405")
@@ -234,16 +288,21 @@ func (logger *CSVLogger) rotateIfNeeded(config AppConfig) {
 	for {
 		if _, err := os.Stat(rotatedPath); os.IsNotExist(err) {
 			break
+		} else if err != nil {
+			return err
 		}
 		rotatedPath = strings.TrimSuffix(logger.path, filepath.Ext(logger.path)) + "_" + timestamp + fmt.Sprintf("_%d", suffix) + filepath.Ext(logger.path)
 		suffix++
 	}
 
 	if err := os.Rename(logger.path, rotatedPath); err != nil {
-		return
+		return err
 	}
-	logger.ensureHeader()
+	if err := logger.ensureHeader(); err != nil {
+		return err
+	}
 	logger.cleanupRotatedLogs(config.LogRotationKeepFiles)
+	return nil
 }
 
 func (logger *CSVLogger) cleanupRotatedLogs(keepFiles int) {

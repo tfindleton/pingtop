@@ -320,7 +320,8 @@ func marshalConfig(config AppConfig) ([]byte, error) {
 func configFromMap(data map[string]any) AppConfig {
 	base := defaultConfig()
 	targets := parseTargets(data["targets"])
-	if len(targets) == 0 {
+	items, isTargetList := data["targets"].([]any)
+	if len(targets) == 0 && !(isTargetList && len(items) == 0) {
 		targets = base.Targets
 	}
 	return AppConfig{

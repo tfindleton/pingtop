@@ -27,6 +27,8 @@
 - single-binary releases for Linux, macOS, and Windows
 - ad hoc target runs from the command line without writing CSV logs
 
+Interactive keyboard controls are available on Linux/WSL and Windows. macOS currently runs in headless mode.
+
 ## Downloads
 
 Prebuilt binaries are published on [GitHub Releases](https://github.com/tfindleton/pingtop/releases).
@@ -89,7 +91,11 @@ pingtop --check-updates --current-version 0.1.3 --update-repo https://github.com
 
 The interactive UI starts with help and events visible and target details hidden by default. It remembers those visibility choices in `pingtop.json`.
 
+The target table's **Fail** column counts all failures for that target since the session started or counters were reset with `r`. Successful checks do not clear it. **Loss%** and **OK/Fail** use the configured rolling stats window (one hour by default), so older results expire from those columns. Press `i` to see details, including the current consecutive failure count. Counters are kept in memory; restarting the app or deleting and re-adding a target starts fresh counters.
+
 Runtime files are written next to the `pingtop` executable: `pingtop.json` for targets and settings, `pingtop_log.csv` for CSV logs, and `pingtop_snapshot_*.txt` for snapshots. When running with `go run`, pingtop uses the launch/current directory instead of Go's temporary build directory.
+
+CSV write errors are reported, with up to 10,000 unsaved rows kept in memory for retry. Queue overflow drops the oldest unsaved rows with a warning. Retries are best effort and partial writes can produce duplicate rows; pending rows do not survive a restart or switching logging off.
 
 **Controls**
 - `q` or `Esc`: quit
@@ -141,4 +147,5 @@ The release workflow verifies that the tag and source version match, runs tests,
 
 ```bash
 go test ./...
+go test -race ./...
 ```

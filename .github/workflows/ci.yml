@@ -31,9 +31,9 @@ jobs:
           cache: true
           cache-dependency-path: go.mod
 
-      - name: Run test suite with coverage
+      - name: Run test suite with race detection and coverage
         if: matrix.os == 'ubuntu-latest'
-        run: go test ./... -covermode=atomic -coverprofile=coverage.out
+        run: go test -race ./... -covermode=atomic -coverprofile=coverage.out
 
       - name: Run test suite
         if: matrix.os != 'ubuntu-latest'

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -158,35 +159,42 @@ func runHeadless(
 	if once {
 		config := configManager.Snapshot()
 		results := monitor.RunSingleCycle(config)
-		stateStore.HandleCycle(results, config, monitor.CurrentCycleID())
-		logger.LogResults(results, config)
+		if err := monitor.recordSingleCycle(results, config, false); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: %v\n", err)
+		}
 		printCycleSummary(results, stateStore.Snapshot())
 		fmt.Println(buildExitSummary(stateStore.Snapshot()))
 		return 0
 	}
 
-	signalCh := make(chan os.Signal, 1)
-	signal.Notify(signalCh, os.Interrupt)
-	defer signal.Stop(signalCh)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
 
 	fmt.Println("pingtop headless mode. Press Ctrl+C to stop.")
 	for {
 		select {
-		case <-signalCh:
+		case <-ctx.Done():
 			fmt.Println(buildExitSummary(stateStore.Snapshot()))
 			return 0
 		default:
 		}
 
 		config := configManager.Snapshot()
-		results := monitor.RunSingleCycle(config)
-		stateStore.HandleCycle(results, config, monitor.CurrentCycleID())
-		logger.LogResults(results, config)
-		printCycleSummary(results, stateStore.Snapshot())
+		results := monitor.RunSingleCycleContext(ctx, config)
+		if len(results) > 0 || ctx.Err() == nil {
+			if err := monitor.recordSingleCycle(results, config, ctx.Err() != nil); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: %v\n", err)
+			}
+			printCycleSummary(results, stateStore.Snapshot())
+		}
+		if ctx.Err() != nil {
+			fmt.Println(buildExitSummary(stateStore.Snapshot()))
+			return 0
+		}
 
 		timer := time.NewTimer(time.Duration(config.CheckIntervalSeconds * float64(time.Second)))
 		select {
-		case <-signalCh:
+		case <-ctx.Done():
 			timer.Stop()
 			fmt.Println(buildExitSummary(stateStore.Snapshot()))
 			return 0
@@ -386,13 +394,11 @@ type PingTopUI struct {
 	running           bool
 	lastUpdateState   string
 	dirty             bool
-	lastRender        uiRenderState
+	lastScreen        string
 	hasLastRender     bool
 }
 
 type uiRenderState struct {
-	StateRevision     uint64
-	ConfigRevision    uint64
 	UpdateStatus      UpdateStatus
 	Paused            bool
 	HelpVisible       bool
@@ -474,9 +480,6 @@ func (ui *PingTopUI) renderIfNeeded(config AppConfig) {
 	}
 	snapshot := ui.stateStore.Snapshot()
 	renderState := ui.buildRenderState(snapshot, config)
-	if !ui.dirty && ui.hasLastRender && renderState == ui.lastRender {
-		return
-	}
 	screen := ui.renderer.BuildScreenWithSelection(
 		snapshot,
 		config,
@@ -489,8 +492,13 @@ func (ui *PingTopUI) renderIfNeeded(config AppConfig) {
 		renderState.EventScrollOffset,
 		renderState.SelectedTarget,
 	)
+	// Ages, stale status, and rolling counters can change without a state
+	// mutation. Build each refresh, but avoid redrawing an unchanged screen.
+	if !ui.dirty && ui.hasLastRender && screen == ui.lastScreen {
+		return
+	}
 	ui.renderer.Draw(screen)
-	ui.lastRender = renderState
+	ui.lastScreen = screen
 	ui.hasLastRender = true
 	ui.dirty = false
 }
@@ -498,8 +506,6 @@ func (ui *PingTopUI) renderIfNeeded(config AppConfig) {
 func (ui *PingTopUI) buildRenderState(snapshot StateSnapshot, config AppConfig) uiRenderState {
 	width, height := termui.TerminalSize()
 	state := uiRenderState{
-		StateRevision:  ui.stateStore.Revision(),
-		ConfigRevision: ui.configManager.Revision(),
 		UpdateStatus:   ui.updateManager.Snapshot(),
 		Paused:         ui.monitor.IsPaused(),
 		HelpVisible:    ui.helpVisible,
@@ -619,7 +625,11 @@ func (ui *PingTopUI) handleKey(key string) {
 		ui.forceRefreshChecks()
 	case "s":
 		ui.dirty = true
-		path := ui.saveSnapshotReport()
+		path, err := ui.saveSnapshotReport()
+		if err != nil {
+			ui.stateStore.AddEvent("warn", "Snapshot save failed: "+err.Error(), time.Time{})
+			return
+		}
 		ui.stateStore.AddEvent("info", "Snapshot saved to "+filepath.Base(path), time.Time{})
 	case "u":
 		ui.dirty = true
@@ -807,7 +817,7 @@ func (ui *PingTopUI) toggleSelectedTarget() {
 	selected := ui.selectedTarget
 	targetValue := configSnapshot.Targets[selected].Value
 	disabled := false
-	config := ui.configManager.Update(func(config *pingtop.AppConfig) {
+	ui.monitor.updateConfig(func(config *pingtop.AppConfig) {
 		if selected < 0 || selected >= len(config.Targets) {
 			return
 		}
@@ -815,8 +825,6 @@ func (ui *PingTopUI) toggleSelectedTarget() {
 		disabled = config.Targets[selected].Disabled
 		targetValue = config.Targets[selected].Value
 	})
-	ui.stateStore.SyncTargets(config)
-	ui.monitor.ForceRefresh()
 	ui.dirty = true
 	if disabled {
 		ui.stateStore.AddEvent("info", "Disabled target "+targetValue, time.Time{})
@@ -856,10 +864,7 @@ func (ui *PingTopUI) cycleLoggingMode() {
 		}
 	}
 	nextMode := loggingModes[(index+1)%len(loggingModes)]
-	ui.configManager.Update(func(config *pingtop.AppConfig) {
-		config.LoggingMode = nextMode
-	})
-	ui.monitor.ForceRefresh()
+	ui.monitor.updateLoggingMode(nextMode)
 	ui.stateStore.AddEvent("info", "Logging mode set to "+nextMode, time.Time{})
 }
 
@@ -917,12 +922,10 @@ func (ui *PingTopUI) submitAddTarget(raw string) {
 		ui.stateStore.AddEvent("warn", "Invalid target: "+err.Error(), time.Time{})
 		return
 	}
-	config := ui.configManager.Update(func(config *pingtop.AppConfig) {
+	config, _ := ui.monitor.updateConfig(func(config *pingtop.AppConfig) {
 		config.Targets = append(config.Targets, target)
 	})
 	ui.selectedTarget = len(config.Targets) - 1
-	ui.stateStore.SyncTargets(config)
-	ui.monitor.ForceRefresh()
 	ui.stateStore.AddEvent("info", "Added target "+target.Value, time.Time{})
 }
 
@@ -953,7 +956,7 @@ func (ui *PingTopUI) submitDeleteTarget(raw string) {
 
 func (ui *PingTopUI) deleteTargetValue(targetToRemove string, raw string) {
 	removed := false
-	config := ui.configManager.Update(func(config *pingtop.AppConfig) {
+	config, _ := ui.monitor.updateConfig(func(config *pingtop.AppConfig) {
 		kept := make([]TargetSpec, 0, len(config.Targets))
 		for _, target := range config.Targets {
 			if target.Value == targetToRemove {
@@ -964,10 +967,8 @@ func (ui *PingTopUI) deleteTargetValue(targetToRemove string, raw string) {
 		}
 		config.Targets = kept
 	})
-	ui.stateStore.SyncTargets(config)
 	ui.normalizeSelectedTarget(config)
 	if removed {
-		ui.monitor.ForceRefresh()
 		ui.stateStore.AddEvent("info", "Deleted target "+targetToRemove, time.Time{})
 	} else {
 		ui.stateStore.AddEvent("warn", "Delete target failed: no match for "+raw, time.Time{})
@@ -1018,11 +1019,10 @@ func (ui *PingTopUI) submitStatsWindow(raw string) {
 		ui.stateStore.AddEvent("warn", "Stats window error: "+err.Error(), time.Time{})
 		return
 	}
-	config := ui.configManager.Update(func(config *pingtop.AppConfig) {
+	config, windowReset := ui.monitor.updateConfig(func(config *pingtop.AppConfig) {
 		config.StatsWindowSeconds = statsWindowSeconds
 	})
-	if ui.stateStore.SyncTargets(config) {
-		ui.monitor.ForceRefresh()
+	if windowReset {
 		ui.stateStore.AddEvent(
 			"info",
 			fmt.Sprintf("Stats window set to %s; rolling counters reset", pingtop.FormatCompactSpan(config.StatsWindowSeconds)),
@@ -1031,13 +1031,17 @@ func (ui *PingTopUI) submitStatsWindow(raw string) {
 	}
 }
 
-func (ui *PingTopUI) saveSnapshotReport() string {
+func (ui *PingTopUI) saveSnapshotReport() (string, error) {
 	snapshot := ui.stateStore.Snapshot()
 	config := ui.configManager.Snapshot()
 	path := ui.runtimePaths.SnapshotPath(time.Time{})
-	_ = os.MkdirAll(filepath.Dir(path), 0o755)
-	_ = os.WriteFile(path, []byte(ui.renderer.BuildReport(snapshot, config, ui.monitor.IsPaused())), 0o644)
-	return path
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(path, []byte(ui.renderer.BuildReport(snapshot, config, ui.monitor.IsPaused())), 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func (ui *PingTopUI) openUpdatePage() {

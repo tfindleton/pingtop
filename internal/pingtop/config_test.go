@@ -241,3 +241,15 @@ func TestConfigManagerRevisionChangesOnUpdateAndSave(t *testing.T) {
 		t.Fatalf("expected revision to increase after save: afterUpdate=%d got=%d", afterUpdate, got)
 	}
 }
+
+func TestConfigManagerPreservesDeletedTargetsAfterRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pingtop.json")
+	manager := NewConfigManager(path)
+	manager.Update(func(config *AppConfig) {
+		config.Targets = nil
+	})
+	manager = NewConfigManager(path)
+	if targets := manager.Snapshot().Targets; len(targets) != 0 {
+		t.Fatalf("expected an empty saved target list to stay empty, got %#v", targets)
+	}
+}

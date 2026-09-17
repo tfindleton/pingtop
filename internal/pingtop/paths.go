@@ -3,7 +3,7 @@ package pingtop
 import (
 	"os"
 	"path/filepath"
-	"strings"
+	"regexp"
 	"time"
 )
 
@@ -11,6 +11,11 @@ const (
 	configFilename = "pingtop.json"
 	logFilename    = "pingtop_log.csv"
 	snapshotPrefix = "pingtop_snapshot_"
+)
+
+var (
+	goRunWorkPath  = regexp.MustCompile(`/go-build[0-9]+/b[0-9]+/exe/[^/]+$`)
+	goRunCachePath = regexp.MustCompile(`/([0-9a-f]{2})/([0-9a-f]{64})-d/[^/]+$`)
 )
 
 type RuntimePaths struct {
@@ -50,7 +55,13 @@ func resolveLaunchPath(argv0, cwd, executable string) string {
 	if baseDir == "" {
 		baseDir = "."
 	}
-	if executable != "" && !isGoRunExecutable(executable) {
+	// go run sets argv[0] to the same build or cache binary as os.Executable.
+	// Falling back to argv[0] would still put runtime files in the build cache.
+	if isGoRunExecutable(executable) || isGoRunExecutable(argv0) {
+		absolute, _ := filepath.Abs(baseDir)
+		return absolute
+	}
+	if executable != "" {
 		if absolute, err := filepath.Abs(executable); err == nil {
 			return absolute
 		}
@@ -86,13 +97,12 @@ func isGoRunExecutable(path string) bool {
 	if path == "" {
 		return false
 	}
-	cleaned := filepath.Clean(path)
-	tempDir := filepath.Clean(os.TempDir())
-	if strings.Contains(cleaned, string(filepath.Separator)+"go-build") {
+	cleaned := filepath.ToSlash(filepath.Clean(path))
+	if goRunWorkPath.MatchString(cleaned) {
 		return true
 	}
-	if tempDir != "" && strings.HasPrefix(cleaned, tempDir) && strings.Contains(cleaned, "go-build") {
-		return true
-	}
-	return false
+	// Recent Go versions can execute directly from the build cache. Match its
+	// hash layout, including custom GOCACHE roots, rather than directory names.
+	match := goRunCachePath.FindStringSubmatch(cleaned)
+	return len(match) == 3 && match[1] == match[2][:2]
 }

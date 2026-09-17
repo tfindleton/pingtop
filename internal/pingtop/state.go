@@ -2,6 +2,7 @@ package pingtop
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 )
@@ -23,12 +24,19 @@ func NewRollingWindowCounter(windowSeconds int) *RollingWindowCounter {
 
 func (counter *RollingWindowCounter) Observe(timestamp time.Time, result CheckResult) {
 	bucketStart := (timestamp.Unix() / int64(counter.bucketSeconds)) * int64(counter.bucketSeconds)
-	if len(counter.buckets) > 0 && counter.buckets[len(counter.buckets)-1].BucketStart == bucketStart {
-		counter.buckets[len(counter.buckets)-1].Summary.Observe(result)
+	// Workers can complete in a different order than their results are applied.
+	// Keep buckets ordered so pruning cannot leave expired results behind.
+	index := sort.Search(len(counter.buckets), func(index int) bool {
+		return counter.buckets[index].BucketStart >= bucketStart
+	})
+	if index < len(counter.buckets) && counter.buckets[index].BucketStart == bucketStart {
+		counter.buckets[index].Summary.Observe(result)
 	} else {
 		bucket := RollingWindowBucket{BucketStart: bucketStart}
 		bucket.Summary.Observe(result)
-		counter.buckets = append(counter.buckets, bucket)
+		counter.buckets = append(counter.buckets, RollingWindowBucket{})
+		copy(counter.buckets[index+1:], counter.buckets[index:])
+		counter.buckets[index] = bucket
 	}
 	counter.total.Observe(result)
 	counter.Prune(timestamp)
@@ -427,8 +435,9 @@ func (store *StateStore) Revision() uint64 {
 }
 
 func (store *StateStore) Snapshot() StateSnapshot {
-	store.mu.RLock()
-	defer store.mu.RUnlock()
+	// Reading rolling summaries also prunes expired buckets.
+	store.mu.Lock()
+	defer store.mu.Unlock()
 
 	now := time.Now()
 	targetStats := make([]TargetStats, 0, len(store.targetOrder))

@@ -30,15 +30,18 @@ var latencyPatterns = []*regexp.Regexp{
 }
 
 type PingRunner struct {
-	goos     string
-	pingPath string
+	goos      string
+	pingPath  string
+	ping6Path string
 }
 
 func NewPingRunner() *PingRunner {
 	pingPath, _ := exec.LookPath("ping")
+	ping6Path, _ := exec.LookPath("ping6")
 	return &PingRunner{
-		goos:     runtime.GOOS,
-		pingPath: pingPath,
+		goos:      runtime.GOOS,
+		pingPath:  pingPath,
+		ping6Path: ping6Path,
 	}
 }
 
@@ -50,20 +53,22 @@ func (runner *PingRunner) PingContext(parent context.Context, ipAddress string, 
 	if err := parent.Err(); err != nil {
 		return false, nil, "canceled", err.Error()
 	}
-	if success, latencyMS, errorCategory, errorMessage, handled := nativePing(ipAddress, timeoutMS); handled {
+	if success, latencyMS, errorCategory, errorMessage, handled := nativePingContext(parent, ipAddress, timeoutMS); handled {
 		return success, latencyMS, errorCategory, errorMessage
 	}
 
 	command := runner.buildCommand(ipAddress, timeoutMS)
 	timeout := time.Duration(math.Max(3.0, float64(timeoutMS)/1000.0+2.0) * float64(time.Second))
+	if command[0] == "ping6" {
+		// macOS ping6 has no per-probe timeout option; -W is a node-info
+		// query. Bound the command itself by the configured probe timeout.
+		timeout = time.Duration(timeoutMS) * time.Millisecond
+	}
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
 	started := time.Now()
-	commandPath := command[0]
-	if runner.pingPath != "" {
-		commandPath = runner.pingPath
-	}
+	commandPath := runner.commandPath(command[0])
 	cmd := exec.CommandContext(ctx, commandPath, command[1:]...)
 	output, err := cmd.CombinedOutput()
 	elapsedMS := float64(time.Since(started)) / float64(time.Millisecond)
@@ -107,11 +112,28 @@ func (runner *PingRunner) buildCommand(ipAddress string, timeoutMS int) []string
 	case "windows":
 		return []string{"ping", "-n", "1", "-w", fmt.Sprintf("%d", timeoutMS), ipAddress}
 	case "darwin":
+		if ip := net.ParseIP(ipAddress); ip != nil && ip.To4() == nil {
+			// ping6 otherwise exits after its default interval plus a fixed
+			// ten-second final wait. Keep that exit beyond our context deadline;
+			// -c 1 still sends exactly one probe and a reply exits immediately.
+			intervalSeconds := int(math.Max(1, math.Ceil(float64(timeoutMS)/1000.0)))
+			return []string{"ping6", "-n", "-c", "1", "-i", strconv.Itoa(intervalSeconds), ipAddress}
+		}
 		return []string{"ping", "-n", "-c", "1", "-W", fmt.Sprintf("%d", timeoutMS), ipAddress}
 	default:
 		timeoutSeconds := int(math.Max(1, math.Ceil(float64(timeoutMS)/1000.0)))
 		return []string{"ping", "-n", "-c", "1", "-W", fmt.Sprintf("%d", timeoutSeconds), ipAddress}
 	}
+}
+
+func (runner *PingRunner) commandPath(command string) string {
+	if command == "ping6" && runner.ping6Path != "" {
+		return runner.ping6Path
+	}
+	if command == "ping" && runner.pingPath != "" {
+		return runner.pingPath
+	}
+	return command
 }
 
 func (runner *PingRunner) parseLatency(output string) *float64 {
@@ -162,6 +184,9 @@ func (resolver *DNSResolver) Resolve(hostname string, timeoutMS int) (bool, stri
 }
 
 func (resolver *DNSResolver) ResolveContext(parent context.Context, hostname string, timeoutMS int) (bool, string, string) {
+	if err := parent.Err(); err != nil {
+		return false, "", err.Error()
+	}
 	ctx, cancel := context.WithTimeout(parent, time.Duration(timeoutMS)*time.Millisecond)
 	defer cancel()
 
@@ -177,11 +202,17 @@ func (resolver *DNSResolver) ResolveContext(parent context.Context, hostname str
 
 	select {
 	case result := <-resultCh:
-		if !result.ok && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		if err := parent.Err(); err != nil {
+			return false, "", err.Error()
+		}
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			return false, "", fmt.Sprintf("dns lookup exceeded %d ms timeout", timeoutMS)
 		}
 		return result.ok, result.address, result.err
 	case <-ctx.Done():
+		if err := parent.Err(); err != nil {
+			return false, "", err.Error()
+		}
 		return false, "", fmt.Sprintf("dns lookup exceeded %d ms timeout", timeoutMS)
 	}
 }
@@ -252,29 +283,54 @@ func (coordinator *CheckCoordinator) ExecuteCycleContext(ctx context.Context, co
 		return nil
 	}
 	results := make([]CheckResult, len(targets))
+	completedResults := make([]bool, len(targets))
 	resultCh := make(chan cycleResult, len(targets))
 	for index, target := range targets {
 		go func(index int, target TargetSpec) {
 			result := coordinator.safeCheckTarget(ctx, target, config.PingTimeoutMS, cycleID, fmt.Sprintf("worker-%d", index+1))
-			select {
-			case resultCh <- cycleResult{index: index, result: result}:
-			case <-ctx.Done():
-			}
+			// Each worker has one buffered slot, including when the caller stops.
+			// Cancellation must not randomly discard an already completed result.
+			resultCh <- cycleResult{index: index, result: result}
 		}(index, target)
 	}
 
+	recordResult := func(item cycleResult) {
+		if item.result.ErrorCategory == "canceled" {
+			return
+		}
+		results[item.index] = item.result
+		completedResults[item.index] = true
+		if onProgress != nil {
+			onProgress(item.result)
+		}
+	}
+	collectedResults := func() []CheckResult {
+		var collected []CheckResult
+		for index, completed := range completedResults {
+			if completed {
+				collected = append(collected, results[index])
+			}
+		}
+		return collected
+	}
 	for completed := 0; completed < len(targets); completed++ {
 		select {
 		case item := <-resultCh:
-			results[item.index] = item.result
-			if onProgress != nil {
-				onProgress(item.result)
-			}
+			recordResult(item)
 		case <-ctx.Done():
-			return nil
+			// Retain results already delivered by fast targets while another target
+			// was pending. Do not wait for unfinished checks after cancellation.
+			for {
+				select {
+				case item := <-resultCh:
+					recordResult(item)
+				default:
+					return collectedResults()
+				}
+			}
 		}
 	}
-	return results
+	return collectedResults()
 }
 
 func (coordinator *CheckCoordinator) CheckTargetContext(ctx context.Context, target TargetSpec, timeoutMS, cycleID int, workerID string) CheckResult {
@@ -327,6 +383,9 @@ func (coordinator *CheckCoordinator) checkTarget(ctx context.Context, target Tar
 	}
 
 	dnsSuccess, resolvedIP, dnsError := coordinator.dnsResolver.ResolveContext(ctx, target.Value, timeoutMS)
+	if err := ctx.Err(); err != nil {
+		return canceledResult(target, cycleID, workerID, err)
+	}
 	if !dnsSuccess {
 		category := "dns_failure"
 		lowered := strings.ToLower(dnsError)

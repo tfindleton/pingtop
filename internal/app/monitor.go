@@ -14,16 +14,19 @@ type BackgroundMonitor struct {
 	logger        *CSVLogger
 	coordinator   *CheckCoordinator
 
-	stopCh      chan struct{}
-	wakeCh      chan struct{}
-	doneCh      chan struct{}
-	pauseMu     sync.RWMutex
-	paused      bool
-	sequence    int64
-	cycleID     int32
-	generation  int64
-	cycleMu     sync.Mutex
-	cancelCycle context.CancelFunc
+	stopCh       chan struct{}
+	wakeCh       chan struct{}
+	doneCh       chan struct{}
+	pauseMu      sync.RWMutex
+	paused       bool
+	sequence     atomic.Int64
+	cycleID      atomic.Int32
+	generation   atomic.Int64
+	cycleMu      sync.Mutex
+	cancelCycle  context.CancelFunc
+	workers      sync.WaitGroup
+	logMu        sync.Mutex
+	lastLogError string
 }
 
 type monitorSignal int
@@ -73,22 +76,54 @@ func (monitor *BackgroundMonitor) Wake() {
 }
 
 func (monitor *BackgroundMonitor) ForceRefresh() {
-	atomic.AddInt64(&monitor.generation, 1)
-	monitor.cancelActiveCycle()
-	monitor.stateStore.ClearActiveCycle()
+	monitor.cycleMu.Lock()
+	monitor.invalidateWorkersLocked()
+	monitor.cycleMu.Unlock()
 	monitor.Wake()
+}
+
+// Keep state synchronization and worker cancellation atomic with result updates.
+// Otherwise a finishing worker could restore the configuration it started with.
+func (monitor *BackgroundMonitor) updateConfig(update func(*AppConfig)) (AppConfig, bool) {
+	monitor.cycleMu.Lock()
+	config := monitor.configManager.Update(update)
+	windowReset := monitor.stateStore.SyncTargets(config)
+	monitor.invalidateWorkersLocked()
+	monitor.cycleMu.Unlock()
+	monitor.Wake()
+	return config, windowReset
+}
+
+func (monitor *BackgroundMonitor) updateLoggingMode(mode string) {
+	monitor.logMu.Lock()
+	defer monitor.logMu.Unlock()
+	config, _ := monitor.updateConfig(func(config *AppConfig) {
+		config.LoggingMode = mode
+	})
+	// Apply mode changes even when paused or all targets are disabled. In
+	// particular, switching off must immediately discard queued log history.
+	monitor.logResultsLocked(nil, config)
+}
+
+func (monitor *BackgroundMonitor) invalidateWorkersLocked() {
+	monitor.generation.Add(1)
+	if monitor.cancelCycle != nil {
+		monitor.cancelCycle()
+	}
+	monitor.stateStore.ClearActiveCycle()
 }
 
 func (monitor *BackgroundMonitor) TogglePause() bool {
 	monitor.pauseMu.Lock()
-	defer monitor.pauseMu.Unlock()
 	monitor.paused = !monitor.paused
-	if monitor.paused {
+	paused := monitor.paused
+	monitor.pauseMu.Unlock()
+	if paused {
 		monitor.ForceRefresh()
 	} else {
 		monitor.Wake()
 	}
-	return monitor.paused
+	return paused
 }
 
 func (monitor *BackgroundMonitor) IsPaused() bool {
@@ -98,18 +133,41 @@ func (monitor *BackgroundMonitor) IsPaused() bool {
 }
 
 func (monitor *BackgroundMonitor) RunSingleCycle(config AppConfig) []CheckResult {
-	cycleID := int(atomic.AddInt32(&monitor.cycleID, 1))
-	results := monitor.coordinator.ExecuteCycleContext(context.Background(), config, cycleID, nil)
+	return monitor.RunSingleCycleContext(context.Background(), config)
+}
+
+func (monitor *BackgroundMonitor) RunSingleCycleContext(ctx context.Context, config AppConfig) []CheckResult {
+	cycleID := int(monitor.cycleID.Add(1))
+	results := monitor.coordinator.ExecuteCycleContext(ctx, config, cycleID, nil)
 	monitor.stampSequences(results)
 	return results
 }
 
 func (monitor *BackgroundMonitor) CurrentCycleID() int {
-	return int(atomic.LoadInt32(&monitor.cycleID))
+	return int(monitor.cycleID.Load())
+}
+
+func (monitor *BackgroundMonitor) recordSingleCycle(results []CheckResult, config AppConfig, interrupted bool) error {
+	cycleID := monitor.CurrentCycleID()
+	if interrupted {
+		// Preserve completed checks without treating the partial set as a complete
+		// cycle or using it to produce a network-wide diagnosis.
+		for _, result := range results {
+			monitor.stateStore.HandleTargetResult(result, config, cycleID, 0)
+		}
+	} else {
+		monitor.stateStore.HandleCycle(results, config, cycleID)
+	}
+	return monitor.logResults(results, config)
 }
 
 func (monitor *BackgroundMonitor) run() {
-	defer close(monitor.doneCh)
+	defer func() {
+		monitor.cancelActiveCycle()
+		monitor.workers.Wait()
+		monitor.stateStore.ClearActiveCycle()
+		close(monitor.doneCh)
+	}()
 	workersStarted := false
 	for {
 		select {
@@ -132,9 +190,7 @@ func (monitor *BackgroundMonitor) run() {
 			continue
 		}
 
-		config := monitor.configManager.Snapshot()
-		generation := atomic.LoadInt64(&monitor.generation)
-		monitor.startTargetWorkers(config, generation)
+		monitor.startTargetWorkers()
 		workersStarted = true
 
 		switch monitor.waitForSignal(24 * time.Hour) {
@@ -147,26 +203,40 @@ func (monitor *BackgroundMonitor) run() {
 	}
 }
 
-func (monitor *BackgroundMonitor) startTargetWorkers(config AppConfig, generation int64) {
-	ctx, cancel := context.WithCancel(context.Background())
+func (monitor *BackgroundMonitor) startTargetWorkers() {
 	monitor.cycleMu.Lock()
-	previousCancel := monitor.cancelCycle
-	monitor.cancelCycle = cancel
-	monitor.cycleMu.Unlock()
-	if previousCancel != nil {
-		previousCancel()
+	defer monitor.cycleMu.Unlock()
+	if monitor.IsPaused() {
+		return
 	}
+	select {
+	case <-monitor.stopCh:
+		return
+	default:
+	}
+	if monitor.cancelCycle != nil {
+		monitor.cancelCycle()
+	}
+	monitor.stateStore.ClearActiveCycle()
+	ctx, cancel := context.WithCancel(context.Background())
+	monitor.cancelCycle = cancel
+	config := monitor.configManager.Snapshot()
+	generation := monitor.generation.Load()
 
 	monitor.stateStore.SyncTargets(config)
 	targets := config.EnabledTargets()
 	if len(targets) == 0 {
-		cycleID := int(atomic.AddInt32(&monitor.cycleID, 1))
+		cycleID := int(monitor.cycleID.Add(1))
 		monitor.stateStore.HandleCycle(nil, config, cycleID)
 		return
 	}
 
 	for index, target := range targets {
-		go monitor.runTargetWorker(ctx, config, target, generation, index+1, fmt.Sprintf("target-%d", index+1))
+		monitor.workers.Add(1)
+		go func(index int, target TargetSpec) {
+			defer monitor.workers.Done()
+			monitor.runTargetWorker(ctx, config, target, generation, index+1, fmt.Sprintf("target-%d", index+1))
+		}(index, target)
 	}
 }
 
@@ -191,20 +261,34 @@ func (monitor *BackgroundMonitor) runTargetWorker(
 		default:
 		}
 
-		cycleID := int(atomic.AddInt32(&monitor.cycleID, 1))
+		cycleID := int(monitor.cycleID.Add(1))
 		checkWorkerID := workerID
 		if checkWorkerID == "" {
 			checkWorkerID = fmt.Sprintf("target-%d", index)
 		}
-		monitor.stateStore.BeginTargetCheck(cycleID, generation, config, target, time.Now())
-		result := monitor.coordinator.CheckTargetContext(ctx, target, config.PingTimeoutMS, cycleID, checkWorkerID)
-		if ctx.Err() != nil || result.ErrorCategory == "canceled" {
-			monitor.stateStore.FinishCycle(cycleID, generation)
+		monitor.cycleMu.Lock()
+		if ctx.Err() != nil {
+			monitor.cycleMu.Unlock()
 			return
 		}
-		result.Sequence = atomic.AddInt64(&monitor.sequence, 1)
-		monitor.stateStore.HandleTargetResult(result, config, cycleID, generation)
-		monitor.logger.LogResults([]CheckResult{result}, config)
+		monitor.stateStore.BeginTargetCheck(cycleID, generation, monitor.configManager.Snapshot(), target, time.Now())
+		monitor.cycleMu.Unlock()
+		result := monitor.coordinator.CheckTargetContext(ctx, target, config.PingTimeoutMS, cycleID, checkWorkerID)
+		// Acquire logging order before accepting the result. Holding this through
+		// the append prevents an older failure from being logged after recovery.
+		monitor.logMu.Lock()
+		monitor.cycleMu.Lock()
+		if ctx.Err() != nil || result.ErrorCategory == "canceled" {
+			monitor.cycleMu.Unlock()
+			monitor.logMu.Unlock()
+			return
+		}
+		result.Sequence = monitor.sequence.Add(1)
+		currentConfig := monitor.configManager.Snapshot()
+		monitor.stateStore.HandleTargetResult(result, currentConfig, cycleID, generation)
+		monitor.cycleMu.Unlock()
+		monitor.logResultsLocked([]CheckResult{result}, currentConfig)
+		monitor.logMu.Unlock()
 
 		timer := time.NewTimer(interval)
 		select {
@@ -221,11 +305,32 @@ func (monitor *BackgroundMonitor) runTargetWorker(
 
 func (monitor *BackgroundMonitor) cancelActiveCycle() {
 	monitor.cycleMu.Lock()
-	cancel := monitor.cancelCycle
-	monitor.cycleMu.Unlock()
-	if cancel != nil {
-		cancel()
+	defer monitor.cycleMu.Unlock()
+	if monitor.cancelCycle != nil {
+		monitor.cancelCycle()
 	}
+}
+
+// Return only new errors so repeated failures do not flood the event history.
+func (monitor *BackgroundMonitor) logResults(results []CheckResult, config AppConfig) error {
+	monitor.logMu.Lock()
+	defer monitor.logMu.Unlock()
+	return monitor.logResultsLocked(results, config)
+}
+
+// The caller holds logMu, and must release cycleMu before filesystem I/O.
+func (monitor *BackgroundMonitor) logResultsLocked(results []CheckResult, config AppConfig) error {
+	err := monitor.logger.LogResults(results, config)
+	if err == nil {
+		monitor.lastLogError = ""
+		return nil
+	}
+	if err.Error() == monitor.lastLogError {
+		return nil
+	}
+	monitor.lastLogError = err.Error()
+	monitor.stateStore.AddEvent("warn", err.Error(), time.Time{})
+	return err
 }
 
 func (monitor *BackgroundMonitor) waitForSignal(duration time.Duration) monitorSignal {
@@ -243,6 +348,6 @@ func (monitor *BackgroundMonitor) waitForSignal(duration time.Duration) monitorS
 
 func (monitor *BackgroundMonitor) stampSequences(results []CheckResult) {
 	for index := range results {
-		results[index].Sequence = atomic.AddInt64(&monitor.sequence, 1)
+		results[index].Sequence = monitor.sequence.Add(1)
 	}
 }
