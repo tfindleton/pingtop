@@ -34,6 +34,31 @@ func TestInferTargetRejectsInvalidValues(t *testing.T) {
 	}
 }
 
+func TestInferTargetRejectsUnsafeHostnames(t *testing.T) {
+	for _, value := range []string{
+		"host\x1b[2J", "host\x00name", "host\x7fname", "host\u009b2J", "host\u202ename",
+		"=1+1", "+command", "@SUM(1)", "-option", "host-", "bad/host", "bad\\host",
+		"https://example.com", "example..com", ".example.com", "example.com..",
+		strings.Repeat("a", 64) + ".com", strings.Repeat("a.", 127) + "a",
+	} {
+		t.Run(value, func(t *testing.T) {
+			if _, err := InferTarget(value); err == nil {
+				t.Fatal("unsafe hostname accepted")
+			}
+		})
+	}
+	for _, value := range []string{
+		"localhost", "my-host.local", "_gateway", "host_name", "xn--bcher-kva.example",
+		"2001:db8::1", strings.Repeat("a", 63) + ".example",
+	} {
+		t.Run(value, func(t *testing.T) {
+			if _, err := InferTarget(value); err != nil {
+				t.Fatalf("valid target rejected: %v", err)
+			}
+		})
+	}
+}
+
 func TestConfigNormalizesAndDeduplicatesTargets(t *testing.T) {
 	config := configFromMap(map[string]any{
 		"check_interval_seconds":        0.1,

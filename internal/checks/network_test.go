@@ -3,12 +3,47 @@ package checks
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestPingRunnerRejectsRelativePATHExecutables(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a Unix shell fixture")
+	}
+	dir := t.TempDir()
+	binDir := filepath.Join(dir, "bin")
+	if err := os.Mkdir(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"ping", "ping6"} {
+		if err := os.WriteFile(filepath.Join(binDir, name), []byte("#!/bin/sh\nprintf 'time=1.0 ms\\n'\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Chdir(dir)
+	t.Setenv("GODEBUG", "execerrdot=1")
+	t.Setenv("PATH", "bin")
+	runner := NewPingRunner()
+	if runner.pingPath != "" || runner.ping6Path != "" {
+		t.Fatalf("cached untrusted relative executable: %#v", runner)
+	}
+	if ok, _, category, _ := runner.Ping("::1", 100); ok || category != "ping_unavailable" {
+		t.Fatalf("relative executable was not rejected: ok=%v category=%q", ok, category)
+	}
+
+	// An explicitly configured absolute PATH entry still works.
+	t.Setenv("PATH", binDir)
+	runner = NewPingRunner()
+	if ok, latency, category, message := runner.Ping("::1", 100); !ok || latency == nil || *latency != 1 {
+		t.Fatalf("trusted executable failed: ok=%v latency=%v category=%q message=%q", ok, latency, category, message)
+	}
+}
 
 func TestPingRunnerBuildsWindowsLinuxAndDarwinCommands(t *testing.T) {
 	runner := NewPingRunner()

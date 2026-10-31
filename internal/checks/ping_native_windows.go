@@ -8,6 +8,8 @@ import (
 	"net"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 func nativePingContext(ctx context.Context, ipAddress string, timeoutMS int) (bool, *float64, string, string, bool) {
@@ -41,7 +43,7 @@ type icmpEchoReply struct {
 }
 
 var (
-	modIphlpapi      = syscall.NewLazyDLL("iphlpapi.dll")
+	modIphlpapi      = windows.NewLazySystemDLL("iphlpapi.dll")
 	procIcmpCreate   = modIphlpapi.NewProc("IcmpCreateFile")
 	procIcmpClose    = modIphlpapi.NewProc("IcmpCloseHandle")
 	procIcmpSendEcho = modIphlpapi.NewProc("IcmpSendEcho")

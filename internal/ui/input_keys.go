@@ -126,22 +126,3 @@ func trailingEscapeSequenceNeedsMore(raw []byte) bool {
 		return false
 	}
 }
-
-func specialWindowsKey(scanCode rune) string {
-	switch scanCode {
-	case 72:
-		return KeyUp
-	case 80:
-		return KeyDown
-	case 75:
-		return KeyLeft
-	case 77:
-		return KeyRight
-	case 73:
-		return KeyPageUp
-	case 81:
-		return KeyPageDown
-	default:
-		return ""
-	}
-}

@@ -5,21 +5,22 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
-	"os/exec"
 	"regexp"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
 )
 
 var versionTagRE = regexp.MustCompile(`^v?(\d+)\.(\d+)\.(\d+)$`)
+var repositoryPartRE = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 
 const (
 	defaultUpdateCheckInterval  = 5 * time.Minute
 	defaultUpdateRequestTimeout = 10 * time.Second
+	maxReleaseResponseBytes     = 1 << 20
 )
 
 type UpdateStatus struct {
@@ -63,10 +64,11 @@ func normalizeRepoURL(rawURL string) string {
 	if strings.HasPrefix(value, "git@github.com:") {
 		value = "https://github.com/" + strings.TrimPrefix(value, "git@github.com:")
 	}
+	value = strings.TrimRight(value, "/")
 	if strings.HasSuffix(value, ".git") {
 		value = strings.TrimSuffix(value, ".git")
 	}
-	return strings.TrimRight(value, "/")
+	return value
 }
 
 func parseVersionTag(tag string) (major, minor, patch int, ok bool) {
@@ -98,20 +100,46 @@ func isNewerVersion(currentVersion, latestVersion string) bool {
 	return latestPatch > currentPatch
 }
 
+// Only accept canonical GitHub paths. In particular, reject credentials,
+// encoded separators, dot segments, and non-HTTPS URL handlers.
+func githubURLParts(rawURL string) ([]string, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Scheme != "https" || !strings.EqualFold(parsed.Host, "github.com") ||
+		parsed.User != nil || parsed.Opaque != "" || parsed.RawQuery != "" || parsed.ForceQuery ||
+		parsed.Fragment != "" || parsed.RawPath != "" {
+		return nil, errors.New("update URL must be an HTTPS GitHub repository or release URL")
+	}
+	parts := strings.Split(strings.TrimPrefix(parsed.Path, "/"), "/")
+	if len(parts) < 2 {
+		return nil, errors.New("update URL must include owner and repository name")
+	}
+	for _, part := range parts {
+		if !repositoryPartRE.MatchString(part) || part == "." || part == ".." {
+			return nil, errors.New("update URL contains an invalid path")
+		}
+	}
+	return parts, nil
+}
+
 func buildReleaseAPIURL(repoURL string) (string, error) {
-	normalized := normalizeRepoURL(repoURL)
-	parsed, err := url.Parse(normalized)
+	parts, err := githubURLParts(normalizeRepoURL(repoURL))
 	if err != nil {
 		return "", err
 	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" || !strings.EqualFold(parsed.Host, "github.com") {
-		return "", errors.New("update repo URL must be a GitHub repository URL")
-	}
-	parts := strings.FieldsFunc(parsed.Path, func(r rune) bool { return r == '/' })
-	if len(parts) < 2 {
-		return "", errors.New("update repo URL must include owner and repository name")
+	if len(parts) != 2 {
+		return "", errors.New("update repo URL must contain only owner and repository name")
 	}
 	return fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/latest", parts[0], parts[1]), nil
+}
+
+func checkUpdateRedirect(request *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("too many update redirects")
+	}
+	if request.URL.Scheme != "https" || !strings.EqualFold(request.URL.Host, "api.github.com") || request.URL.User != nil {
+		return errors.New("update redirect must stay on https://api.github.com")
+	}
+	return nil
 }
 
 func fetchLatestRelease(repoURL string, timeout time.Duration) (string, string, error) {
@@ -126,7 +154,10 @@ func fetchLatestRelease(repoURL string, timeout time.Duration) (string, string, 
 	request.Header.Set("Accept", "application/vnd.github+json")
 	request.Header.Set("User-Agent", "pingtop-update-check")
 
-	client := &http.Client{Timeout: timeout}
+	if timeout <= 0 {
+		timeout = defaultUpdateRequestTimeout
+	}
+	client := &http.Client{Timeout: timeout, CheckRedirect: checkUpdateRedirect}
 	response, err := client.Do(request)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -145,21 +176,28 @@ func fetchLatestRelease(repoURL string, timeout time.Duration) (string, string, 
 		return "", "", fmt.Errorf("GitHub update check returned HTTP %d", response.StatusCode)
 	}
 
+	data, err := io.ReadAll(io.LimitReader(response.Body, maxReleaseResponseBytes+1))
+	if err != nil {
+		return "", "", err
+	}
+	if len(data) > maxReleaseResponseBytes {
+		return "", "", errors.New("GitHub release response exceeded size limit")
+	}
 	var payload struct {
 		TagName string `json:"tag_name"`
-		HTMLURL string `json:"html_url"`
 	}
-	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+	if err := json.Unmarshal(data, &payload); err != nil {
 		return "", "", err
 	}
 	if _, _, _, ok := parseVersionTag(payload.TagName); !ok {
 		return "", "", errors.New("latest GitHub release did not contain a semantic version tag")
 	}
-	htmlURL := strings.TrimSpace(payload.HTMLURL)
-	if htmlURL == "" {
-		htmlURL = normalizeRepoURL(repoURL) + "/releases"
-	}
-	return strings.TrimSpace(payload.TagName), htmlURL, nil
+	// Build the link from validated inputs instead of passing a response's
+	// html_url to the operating system's URL handler.
+	tag := strings.TrimSpace(payload.TagName)
+	parts, _ := githubURLParts(normalizeRepoURL(repoURL)) // Validated above.
+	releaseURL := fmt.Sprintf("https://github.com/%s/%s/releases/tag/%s", parts[0], parts[1], tag)
+	return tag, releaseURL, nil
 }
 
 type releaseFetcher func(repoURL string, timeout time.Duration) (string, string, error)
@@ -253,7 +291,7 @@ func (manager *UpdateManager) OpenPage() (bool, string) {
 		return false, "No project URL configured for update checks"
 	}
 	if err := openBrowser(targetURL); err != nil {
-		return false, fmt.Sprintf("Unable to open browser for %s", targetURL)
+		return false, fmt.Sprintf("Unable to open browser: %v", err)
 	}
 	return true, targetURL
 }
@@ -318,15 +356,16 @@ func (manager *UpdateManager) run() {
 }
 
 func openBrowser(targetURL string) error {
-	var command []string
-	switch runtime.GOOS {
-	case "windows":
-		command = []string{"rundll32", "url.dll,FileProtocolHandler", targetURL}
-	case "darwin":
-		command = []string{"open", targetURL}
-	default:
-		command = []string{"xdg-open", targetURL}
+	parts, err := githubURLParts(targetURL)
+	if err != nil {
+		return err
 	}
-	cmd := exec.Command(command[0], command[1:]...)
-	return cmd.Start()
+	validPath := len(parts) == 2 || (len(parts) == 3 && parts[2] == "releases")
+	if len(parts) == 5 && parts[2] == "releases" && parts[3] == "tag" {
+		_, _, _, validPath = parseVersionTag(parts[4])
+	}
+	if !validPath {
+		return errors.New("update URL must point to a GitHub repository or release")
+	}
+	return launchBrowser(targetURL)
 }

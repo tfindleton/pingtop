@@ -36,17 +36,3 @@ func TestTrailingEscapeSequenceNeedsMore(t *testing.T) {
 		t.Fatal("expected complete arrow sequence to stop waiting")
 	}
 }
-
-func TestSpecialWindowsKeyMapsScrollKeys(t *testing.T) {
-	tests := map[rune]string{
-		72: KeyUp,
-		80: KeyDown,
-		73: KeyPageUp,
-		81: KeyPageDown,
-	}
-	for scanCode, want := range tests {
-		if got := specialWindowsKey(scanCode); got != want {
-			t.Fatalf("scan code %d: expected %q, got %q", scanCode, want, got)
-		}
-	}
-}

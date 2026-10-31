@@ -25,8 +25,20 @@ func InferTarget(value string) (TargetSpec, error) {
 	if hostname == "" {
 		return TargetSpec{}, errors.New("hostname cannot be empty")
 	}
-	if strings.ContainsAny(hostname, " \t\r\n") {
-		return TargetSpec{}, errors.New("hostname cannot contain whitespace")
+	if len(hostname) > 253 {
+		return TargetSpec{}, errors.New("hostname cannot exceed 253 characters")
+	}
+	for _, label := range strings.Split(hostname, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return TargetSpec{}, errors.New("hostname labels must contain 1 to 63 characters and cannot start or end with a hyphen")
+		}
+		for _, char := range label {
+			// Allow underscores used by local DNS names, but never terminal
+			// control sequences, URL syntax, or spreadsheet formula prefixes.
+			if !(char >= 'a' && char <= 'z' || char >= '0' && char <= '9' || char == '-' || char == '_') {
+				return TargetSpec{}, errors.New("hostname must use ASCII letters, digits, hyphens, or underscores (use Punycode for international names)")
+			}
+		}
 	}
 	return TargetSpec{Value: hostname, Kind: "hostname"}, nil
 }

@@ -36,13 +36,16 @@ type PingRunner struct {
 }
 
 func NewPingRunner() *PingRunner {
-	pingPath, _ := exec.LookPath("ping")
-	ping6Path, _ := exec.LookPath("ping6")
-	return &PingRunner{
-		goos:      runtime.GOOS,
-		pingPath:  pingPath,
-		ping6Path: ping6Path,
+	runner := &PingRunner{goos: runtime.GOOS}
+	// LookPath may return both a relative path and exec.ErrDot. Discard the
+	// path on error so caching it cannot bypass exec.Command's safety check.
+	if path, err := exec.LookPath("ping"); err == nil {
+		runner.pingPath = path
 	}
+	if path, err := exec.LookPath("ping6"); err == nil {
+		runner.ping6Path = path
+	}
+	return runner
 }
 
 func (runner *PingRunner) Ping(ipAddress string, timeoutMS int) (bool, *float64, string, string) {
@@ -90,6 +93,9 @@ func (runner *PingRunner) PingContext(parent context.Context, ipAddress string, 
 	}
 
 	var execErr *exec.Error
+	if errors.Is(err, exec.ErrDot) {
+		return false, nil, "ping_unavailable", "refusing to run system ping from a relative PATH entry"
+	}
 	if errors.As(err, &execErr) && errors.Is(execErr.Err, exec.ErrNotFound) {
 		return false, nil, "ping_unavailable", "system ping command not found"
 	}

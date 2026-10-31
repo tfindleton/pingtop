@@ -3,7 +3,6 @@
 <p>
   <a href="https://github.com/tfindleton/pingtop/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/tfindleton/pingtop/ci.yml?branch=main&label=ci&logo=githubactions"></a>
   <a href="https://github.com/tfindleton/pingtop/blob/main/go.mod"><img alt="Go Version" src="https://img.shields.io/github/go-mod/go-version/tfindleton/pingtop?logo=go"></a>
-  <a href="https://goreportcard.com/report/github.com/tfindleton/pingtop"><img alt="Go Report Card" src="https://goreportcard.com/badge/github.com/tfindleton/pingtop"></a>
 </p>
 
 <p>
@@ -39,6 +38,10 @@ Prebuilt binaries are published on [GitHub Releases](https://github.com/tfindlet
 - size: release asset sizes vary by platform and version; see the latest release assets for exact download sizes
 
 ## Quick Start
+
+Building from source requires Go 1.26.10 or newer. Use the latest patch of a
+[supported Go release](https://go.dev/doc/devel/release); the compiler's standard
+library is included in the resulting binary.
 
 Run from source:
 
@@ -78,6 +81,10 @@ go build -o pingtop.exe .
 
 Passing one or more positional targets overrides the configured target list for that run only. Those ad hoc runs keep the normal UI or headless behavior, but CSV logging is disabled for that session.
 
+Targets accept IPv4, IPv6, and ASCII hostnames (including local names with
+underscores). Use Punycode for international domain names. Invalid hostnames and
+terminal control characters are rejected.
+
 To debug update detection without publishing a new release, run:
 
 ```bash
@@ -86,6 +93,12 @@ pingtop --updates
 pingtop -u --current-version 0.1.3
 pingtop --check-updates --current-version 0.1.3 --update-repo https://github.com/tfindleton/pingtop
 ```
+
+Update repositories must be HTTPS GitHub repository URLs; the
+`git@github.com:owner/repo.git` form is also accepted. Update checks stay on the
+HTTPS GitHub API, limit response size, and construct release links from the
+validated repository and version tag. The `u` key only opens GitHub repository
+or release pages.
 
 ## Controls
 
@@ -100,6 +113,11 @@ Runtime files are written next to the `pingtop` executable: `pingtop.json` for t
 CSV write errors are reported, with up to 10,000 unsaved rows kept in memory for retry. Queue overflow drops the oldest unsaved rows with a warning. Retries are best effort and partial writes can produce duplicate rows; pending rows do not survive a restart or switching logging off.
 
 The UI shows `off (no CSV)` when logging is off; press `l` to enable it for future checks. Command-line target runs show the selected event-logging mode with `CSV disabled; ad hoc` because those sessions never write CSV files; `l` still changes which in-memory events are recorded. Last-failure details and manual snapshots remain available in either case.
+
+On Windows, the monitor temporarily disables Quick Edit selection and configures
+keyboard input explicitly, then restores the previous input mode on exit. Input
+is processed in bounded batches so queued console events, held keys, and pasted
+text do not delay screen updates with a redraw for every character.
 
 **Controls**
 - `q` or `Esc`: quit
@@ -145,11 +163,49 @@ git tag v0.1.3
 git push origin v0.1.3
 ```
 
-The release workflow verifies that the tag and source version match, runs tests, builds release archives, and attaches them to the GitHub release automatically.
+The release workflow verifies that the tag and source version match, runs tests
+and vulnerability checks for every release target, builds release archives, and
+attaches them to the GitHub release automatically. Each compiled binary is
+scanned before packaging; a failed scan prevents publication.
 
 ## Tests
 
 ```bash
 go test ./...
 go test -race ./...
+go vet ./...
+go mod verify
 ```
+
+Windows input tests run in an isolated hidden console and cover inherited input
+modes, queued events, key repeats, response deadlines, and mode restoration.
+
+## Security Checks
+
+Run the same package-level vulnerability check used by CI:
+
+```bash
+go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+govulncheck -scan=package ./...
+```
+
+The [security workflow](.github/workflows/security.yml) checks all seven release
+OS/architecture combinations on pull requests, pushes to `main`, weekly, and
+before releases. Package-level scans also flag advisories in imported packages
+whose vulnerable functions may not be called. GitHub Actions are pinned to
+commit hashes, and Dependabot checks Go modules and Actions for updates weekly.
+Only the release publishing job receives repository write permission.
+
+Keep the minimum patched Go version in `go.mod` current when new security fixes
+are published, and update the pinned `govulncheck` version in both workflows and
+the command above when upgrading the scanner. To inspect an existing binary:
+
+```bash
+govulncheck -mode=binary ./pingtop
+```
+
+A clean scan means no known vulnerabilities were reported for the scanned build
+and current [Go vulnerability database](https://vuln.go.dev/); it is not a
+guarantee against undiscovered vulnerabilities. Existing release binaries must
+be rebuilt with the patched toolchain to receive standard-library fixes. The
+scanner does not audit the operating system, system `ping`, or browser.

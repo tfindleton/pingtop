@@ -443,22 +443,26 @@ func NewPingTopUI(
 }
 
 func (ui *PingTopUI) Run() int {
-	ui.updateManager.Start()
-	ui.monitor.Start()
-	ui.renderer.Enter()
-	defer func() {
-		ui.monitor.Stop()
-		ui.updateManager.Stop()
-		ui.renderer.Leave()
-	}()
-
 	inputHandler, err := termui.NewInputHandler()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, termui.FormatInputError(err))
 		return 1
 	}
-	defer inputHandler.Close()
+	ui.updateManager.Start()
+	ui.monitor.Start()
+	ui.renderer.Enter()
+	defer func() {
+		inputHandler.Close()
+		ui.monitor.Stop()
+		ui.updateManager.Stop()
+		ui.renderer.Leave()
+	}()
 
+	ui.runInputLoop(inputHandler)
+	return 0
+}
+
+func (ui *PingTopUI) runInputLoop(inputHandler termui.InputHandler) {
 	for ui.running {
 		config := ui.configManager.Snapshot()
 		ui.syncUpdateStatus()
@@ -466,13 +470,13 @@ func (ui *PingTopUI) Run() int {
 		keys := inputHandler.ReadKeys(time.Duration(config.UIRefreshIntervalSeconds * float64(time.Second)))
 		for _, key := range keys {
 			ui.handleKey(key)
-			if ui.running {
-				ui.syncUpdateStatus()
-				ui.renderIfNeeded(AppConfig{})
+			if !ui.running {
+				break
 			}
 		}
+		// Apply the whole input batch before drawing again. Pasted text and
+		// held keys should not require a complete screen write per character.
 	}
-	return 0
 }
 
 func (ui *PingTopUI) renderIfNeeded(config AppConfig) {

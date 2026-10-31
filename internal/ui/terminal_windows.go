@@ -5,8 +5,9 @@ package ui
 import (
 	"os"
 	"strconv"
-	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 const enableVirtualTerminalProcessing = 0x0004
@@ -32,7 +33,7 @@ type consoleScreenBufferInfo struct {
 }
 
 var (
-	modKernel32                    = syscall.NewLazyDLL("kernel32.dll")
+	modKernel32                    = windows.NewLazySystemDLL("kernel32.dll")
 	procGetConsoleMode             = modKernel32.NewProc("GetConsoleMode")
 	procSetConsoleMode             = modKernel32.NewProc("SetConsoleMode")
 	procGetConsoleScreenBufferInfo = modKernel32.NewProc("GetConsoleScreenBufferInfo")

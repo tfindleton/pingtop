@@ -2,7 +2,9 @@ package ui
 
 import (
 	"fmt"
+	"io"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -93,24 +95,42 @@ func (renderer *Renderer) Leave() {
 }
 
 func (renderer *Renderer) Draw(text string) {
+	renderer.drawTo(os.Stdout, text)
+}
+
+func (renderer *Renderer) drawTo(output io.Writer, text string) {
 	if !renderer.ansi {
-		fmt.Fprint(os.Stdout, text)
 		if !strings.HasSuffix(text, "\n") {
-			fmt.Fprint(os.Stdout, "\n")
+			text += "\n"
 		}
+		_, _ = io.WriteString(output, text)
 		return
 	}
 
 	lines := strings.Split(text, "\n")
+	var frame strings.Builder
+	frame.Grow(len(text) + 20*max(len(lines), renderer.lastRenderedLineCount))
+	moveToRow := func(row int) {
+		frame.WriteString("\x1b[")
+		frame.WriteString(strconv.Itoa(row))
+		frame.WriteString(";1H")
+	}
 	for index, line := range lines {
-		fmt.Fprintf(os.Stdout, "\x1b[%d;1H\x1b[2K%s", index+1, line)
+		moveToRow(index + 1)
+		frame.WriteString("\x1b[2K")
+		frame.WriteString(line)
 	}
 	for index := len(lines) + 1; index <= renderer.lastRenderedLineCount; index++ {
-		fmt.Fprintf(os.Stdout, "\x1b[%d;1H\x1b[2K", index)
+		moveToRow(index)
+		frame.WriteString("\x1b[2K")
 	}
 	if _, height := terminalSize(); clearBelowAllowed(len(lines), height) {
-		fmt.Fprintf(os.Stdout, "\x1b[%d;1H\x1b[J", len(lines)+1)
+		moveToRow(len(lines) + 1)
+		frame.WriteString("\x1b[J")
 	}
+	// One write per frame avoids dozens of synchronous console/ConPTY calls
+	// before the input loop can process the next batch of keys.
+	_, _ = io.WriteString(output, frame.String())
 	renderer.lastRenderedLineCount = len(lines)
 }
 
