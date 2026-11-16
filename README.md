@@ -39,7 +39,7 @@ Prebuilt binaries are published on [GitHub Releases](https://github.com/tfindlet
 
 ## Quick Start
 
-Building from source requires Go 1.26.10 or newer. Use the latest patch of a
+Building from source requires Go 1.26.11 or newer. Use the latest patch of a
 [supported Go release](https://go.dev/doc/devel/release); the compiler's standard
 library is included in the resulting binary.
 
